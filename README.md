@@ -79,7 +79,7 @@ This branch adds or fixes current-client server behavior for:
 - CUB archive stories derive unlocks from owned partners and their progression, persist newly unlocked entries, and synchronize after committed changes and login.
 - Norman sweep (`SweepStrongholdStageRequest`) resolves the configured group and its stages, handles already-paid partial clears, and shares normal-clear progression and reward settlement.
 - Legacy Stronghold quick clear (`BfrtOneKeyPassGroupRequest`) validates the formation and computes battle power from character progression, equipment, skills, and authoritative tables instead of the uncomputed persisted `Ability` field. Attribute tables preserve original Q32.32 values as hexadecimal strings for client-compatible rounding.
-- F.O.S. course battle results, exam scoring, rewards, and saved state have compatibility coverage. Lesson result saving remains explicitly blocked because the authoritative lesson-clear rule is missing; no inferred lesson completion or mission credit is awarded.
+- F.O.S. course battle results, table-driven lesson completion, exam scoring, rewards, and saved state have compatibility coverage.
 
 Mission coverage is not complete: Basic Research category `27000`, extended character/fashion task filters, and standard client-event subsystem eligibility still need authoritative rules. Unsupported predicates do not receive guessed completion credit.
 
@@ -226,6 +226,51 @@ python Scripts\export_native_research.py `
 ```
 
 The generated tree contains `PGR_DATA\en\lua`, decoded `bytes` JSON, matching `table` TSV files, raw unsupported table assets, referenced `assets` textures, `index.msgpack`, `version.json`, `manifest.json`, and `SHA256SUMS`. `--all-textures` is available for a complete indexed texture export and may require substantially more disk space. IL2CPP `dump.cs` remains an external Il2CppDumper/Cpp2IL step.
+
+### Single Unity character probe
+
+`Scripts/extract_unity_character.py` loads one role Prefab and its matching `product/role` plus `pc/role` bundles into a shared UnityPy environment. It exports referenced Mesh objects as OBJ, body textures as PNG, the Prefab Transform/Avatar hierarchy, AnimatorController parameters and states, and state-to-AnimationClip bindings. It is intentionally scoped to one model and does not modify the installed client.
+
+```powershell
+python Scripts\extract_unity_character.py `
+  --model r3dante `
+  --game-dir "C:\Program Files (x86)\Steam\steamapps\common\Punishing Gray Raven" `
+  --index "..\PGR-native-research-4.7.0\PGR_DATA\en\index.json" `
+  --output "..\PGR-native-research-4.7.0\PGR_DATA\en\model_samples"
+```
+
+The sample report is written to `model_samples\r3dante\sample.json`; OBJ meshes, PNG textures, skeleton paths, AnimatorController layers, parameters, AnimationClip curve/binding summaries, and read-only MonoBehaviour component identities are kept beside it. The extractor does not execute runtime Lua/MonoBehaviour IK.
+
+To build a directly viewable skinned GLB for the same sample, use the separate builder. It reopens the original bundles so the GLB contains actual vertex weights, inverse bind poses, the full Prefab Transform hierarchy, and embedded material textures:
+
+```powershell
+python Scripts\build_character_glb.py `
+  --model r5kalienina `
+  --controller-prefix R5KalieninaMd010011 `
+  --clip Stand1 `
+  --game-dir "C:\Program Files (x86)\Steam\steamapps\common\Punishing Gray Raven" `
+  --index "..\PGR-native-research-4.7.0\PGR_DATA\en\index.json" `
+  --sample-dir "..\PGR-native-research-4.7.0\PGR_DATA\en\model_samples\r5kalienina"
+```
+
+This writes `R5KalieninaMd010011_Stand1.glb` beside `sample.json`. The builder converts Unity handedness, triangle winding, and UV orientation, pads one/two-influence skin streams to glTF's four-component attributes, and preserves rigid face/eye skinning. Humanoid MuscleClip data is decoded into standard glTF translation/rotation/scale channels, so Blender imports the selected clip on the armature timeline. Repeat `--clip` for more named clips, or use `--all-clips` to include all unique Transform-animation clips referenced by the selected controller family. Materials use portable unlit base-color textures; custom Unity toon lighting, packed normal maps, flow effects, and outline passes are not reproduced.
+
+The main-screen idle and touch/interaction motions are in the character-specific `*Display` controller, not the combat controller. For example, the Kalienina sample can export its complete display set with:
+
+```powershell
+python Scripts\build_character_glb.py `
+  --model r5kalienina `
+  --controller-prefix R5KalieninaMd010011Display `
+  --all-clips `
+  --game-dir "C:\Program Files (x86)\Steam\steamapps\common\Punishing Gray Raven" `
+  --index "..\PGR-native-research-4.7.0\PGR_DATA\en\index.json" `
+  --sample-dir "..\PGR-native-research-4.7.0\PGR_DATA\en\model_samples\r5kalienina" `
+  --output "..\PGR-native-research-4.7.0\PGR_DATA\en\model_samples\r5kalienina\R5KalieninaMd010011Display_all.glb"
+```
+
+This preserves the source clip names `StandAct0101` and `BoardAct0201`–`BoardAct1007` in one GLB. `R5KalieninaMd010011BodyVC.obj` is geometry-only; the builder therefore reopens the matching Prefab/VC bundles so the exported asset retains the armature, skin weights, and all associated renderers. The Prefab's `XDynamicBone`/`XDynamicBoneCollider` components are runtime metadata and are not executable glTF behavior; the display clips do contain authored keyframes for 116 auxiliary hair/skirt/tape bone paths, while the remaining spring response still requires the original runtime or a separate solver.
+
+Run the builder regression tests with `python -m unittest discover -s Scripts -p test_build_character_glb.py`. The repaired Kalienina and Dante exports were also checked with the Khronos glTF validator and imported/rendered in Blender 5.2, including posed face/eye skinning checks.
 
 ## Local account flow
 
