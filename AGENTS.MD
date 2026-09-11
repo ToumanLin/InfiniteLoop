@@ -32,6 +32,26 @@ For all game-protocol work:
 - `Resources/`: runtime configuration, authoritative client table TSVs, data fixtures, and notices.
 - `run_steam.py` and `proxy.py`: local Steam/PC bridge and mitmproxy routing.
 
+## Local workstation paths
+
+These paths describe the current Windows development machine. The launcher-managed build revision can change; use `build-state.json` as the source of truth for the active server and resource directories.
+
+- Game client: `C:\Program Files (x86)\Steam\steamapps\common\Punishing Gray Raven\`
+- Launcher project and launcher log: `C:\Users\Touma\Documents\My_PGR\AscNetLauncher\` and `C:\Users\Touma\Documents\My_PGR\AscNetLauncher\launcher.log`
+- Launcher state: `C:\Users\Touma\AppData\Local\AscNetLauncher\local\build-state.json`
+- Active launcher-managed server/resource build: the `serverDirectory` and `resourceDirectory` values in `build-state.json`
+- Launcher-managed server log: `C:\Users\Touma\AppData\Local\AscNetLauncher\local\logs\server.log`
+- Launcher-managed MongoDB log: `C:\Users\Touma\AppData\Local\AscNetLauncher\local\logs\mongod.log`
+- Game client log directory: `C:\Users\Touma\AppData\LocalLow\kurogame\PGR\log\`
+- Local purchase patch artifacts and rollback backups: `InfiniteLoop/.runtime/store-client-patch/` and `InfiniteLoop/.runtime/store-server-backup/` (ignored runtime artifacts; do not commit them)
+
+Useful PowerShell commands:
+
+```powershell
+Get-Content "C:\Users\Touma\AppData\Local\AscNetLauncher\local\logs\server.log" -Tail 100 -Wait
+Select-String -Path "C:\Users\Touma\AppData\Local\AscNetLauncher\local\logs\server.log" -Pattern "Purchase|Pay|Buy|package"
+```
+
 ## Tables and protocol mechanics
 
 - Treat `Resources/table/**/*.tsv` as authoritative table input. `AscNet.Table` generates typed row classes from those files; consume them at runtime with `TableReaderV2.Parse<T>()`. Never hand-edit source-generator output or other generated table rows—change the authoritative TSV or generator instead.

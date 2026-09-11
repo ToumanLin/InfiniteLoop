@@ -43,11 +43,14 @@ namespace AscNet.GameServer.Handlers
     public class PayInitiatedResponse
     {
         public int Code;
+        public string GameOrder { get; set; } = "";
+        public bool LocalCompleted { get; set; }
+        public List<RewardGoods> RewardList { get; set; } = new();
     }
 #pragma warning restore CS8618 // Non-nullable field must contain a non-null value when exiting constructor. Consider declaring as nullable.
     #endregion
 
-    internal class PayModule
+    internal partial class PayModule
     {
         private const string PurchaseSnapshotPath = "Configs/client_purchases.json";
         private static readonly Lazy<JObject> RetailPurchaseSnapshot = new(() => JsonSnapshot.LoadObject(PurchaseSnapshotPath));
@@ -56,6 +59,7 @@ namespace AscNet.GameServer.Handlers
         public static void GetPurchaseListRequestHandler(Session session, Packet.Request packet)
         {
             GetPurchaseListRequest request = packet.Deserialize<GetPurchaseListRequest>();
+            GrantMailDailyRewards(session);
             session.SendResponse(BuildPurchaseListResponse(request.UiTypeList, session.player), packet.Id);
         }
 
@@ -105,12 +109,21 @@ namespace AscNet.GameServer.Handlers
                 if (purchaseInfo is not Dictionary<dynamic, dynamic> data)
                     continue;
                 uint id = ReadDynamicUInt(data, "Id");
-                data["BuyTimes"] = player?.PurchaseBuyTimes.GetValueOrDefault(id) ?? 0;
+                data["BuyTimes"] = player is null ? 0 : CurrentBuyTimes(player, data);
                 data["LastBuyTime"] = player?.PurchaseLastBuyTimes.GetValueOrDefault(id) ?? 0L;
-                data["DailyRewardRemainDay"] = 0;
-                data["BuyLimitRemainDay"] = 0;
-                data["IsDailyRewardGet"] = false;
-                data["PurchaseSignInInfo"] = null!;
+                int days = RemainingDays(player, id);
+                if (days > 0 && player?.PurchaseBuyTimes.GetValueOrDefault(id) == 0) data["BuyTimes"] = 1;
+                data["DailyRewardRemainDay"] = days;
+                data["BuyLimitRemainDay"] = days;
+                data["IsDailyRewardGet"] = player?.PurchaseDailyPasses.GetValueOrDefault(id)?.LastClaimDay == PurchaseDay();
+                if (data.TryGetValue("PurchaseSignInInfo", out dynamic? signRaw) && signRaw is Dictionary<dynamic, dynamic> sign)
+                {
+                    var pass = player?.PurchaseDailyPasses.GetValueOrDefault(id);
+                    sign["PurchaseSignInData"] = new Dictionary<dynamic, dynamic>
+                    {
+                        ["SignRound"] = 1, ["RewardIndexList"] = pass?.RewardIndexList ?? new List<int>()
+                    };
+                }
                 data["DailyRewardSupplementGetData"] = null!;
             }
         }
@@ -137,11 +150,16 @@ namespace AscNet.GameServer.Handlers
                                 BuyTime = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
                                 ConsumeId = ReadDynamicInt(info!, "ConsumeId"), ConsumeCount = cost, Goods = goods
                             };
+                            PreparePassUpdates(session.player, info!, request.Count, pending);
+                            pending.PeriodBuyTimes = checked(CurrentBuyTimes(session.player, info!) + request.Count);
                             session.player.PendingPurchase = pending;
                             try { session.player.SaveChecked(); }
                             catch { session.player.PendingPurchase = null; throw; }
                         }
                         RewardApplicationResult result = ResumePendingPurchase(session)!;
+                        // A later mail save must not turn an already committed purchase into a failed purchase.
+                        try { GrantMailDailyRewards(session); }
+                        catch (Exception error) { session.log.Error($"Daily purchase mail will retry on refresh: {error}"); }
                         response.NewPurchaseInfoList = BuildPurchaseListResponse(request.UiTypeList, session.player).PurchaseInfoList;
                         ApplyPurchaseState([info!], session.player);
                         ReplacePurchaseInfo(response.NewPurchaseInfoList, info!);
@@ -158,6 +176,7 @@ namespace AscNet.GameServer.Handlers
                     session.log.Error($"Purchase {request.Id} failed: {exception}");
                     response.Code = 2; // ServerInternalError (CodeText)
                 }
+                if (response.Code != 0) session.log.Warn($"Purchase rejected: package={request.Id}, count={request.Count}, code={response.Code}");
                 session.SendResponse(response, packet.Id);
             }
         }
@@ -179,6 +198,13 @@ namespace AscNet.GameServer.Handlers
             bool hadTime = session.player.PurchaseLastBuyTimes.TryGetValue(pending.Id, out long oldTime);
             session.player.PurchaseBuyTimes[pending.Id] = checked(pending.PreviousBuyTimes + pending.Count);
             session.player.PurchaseLastBuyTimes[pending.Id] = pending.BuyTime;
+            bool hadPeriod = session.player.PurchasePeriodBuyTimes.TryGetValue(pending.Id, out int oldPeriod);
+            session.player.PurchasePeriodBuyTimes[pending.Id] = pending.PeriodBuyTimes > 0
+                ? pending.PeriodBuyTimes : session.player.PurchaseBuyTimes[pending.Id];
+            Dictionary<uint, PlayerPurchaseDailyPass> oldPasses = session.player.PurchaseDailyPasses;
+            session.player.PurchaseDailyPasses = new(oldPasses);
+            foreach (var pass in pending.DailyPasses)
+                session.player.PurchaseDailyPasses[pass.Key] = pass.Value;
             session.player.PendingPurchase = null;
             try { session.player.SaveChecked(); }
             catch
@@ -188,6 +214,9 @@ namespace AscNet.GameServer.Handlers
                 if (hadTime) session.player.PurchaseLastBuyTimes[pending.Id] = oldTime;
                 else session.player.PurchaseLastBuyTimes.Remove(pending.Id);
                 session.player.PendingPurchase = pending;
+                session.player.PurchaseDailyPasses = oldPasses;
+                if (hadPeriod) session.player.PurchasePeriodBuyTimes[pending.Id] = oldPeriod;
+                else session.player.PurchasePeriodBuyTimes.Remove(pending.Id);
                 throw;
             }
             return result;
@@ -198,14 +227,14 @@ namespace AscNet.GameServer.Handlers
         {
             goods = []; cost = 0; info = null;
             if (request.Count <= 0 || request.Id > int.MaxValue
-                || (request.Param is not null && (request.Param is not System.Collections.ICollection parameters || parameters.Count != 0)))
+                || !ValidPurchaseParam(request.Param))
                 return 20053031;
             if (request.DiscountId > 0) return 20053014;
             if (!TryFindPurchaseInfo(request.Id, request.UiTypeList, out info)) return 20053001;
             PlayerPendingPurchase? pending = session.player.PendingPurchase;
             if (pending is not null)
                 return pending.Id == request.Id && pending.Count == request.Count ? 0 : 20053031;
-            int previous = session.player.PurchaseBuyTimes.GetValueOrDefault(request.Id);
+            int previous = CurrentBuyTimes(session.player, info!);
             int limit = ReadDynamicInt(info!, "BuyLimitTimes");
             if (previous < 0 || (long)previous + request.Count > int.MaxValue
                 || (limit > 0 && (long)previous + request.Count > limit)) return 20053005;
@@ -220,14 +249,14 @@ namespace AscNet.GameServer.Handlers
             if (!AreConditionsSatisfied(session, ReadIds(info!, "Conditions"))) return 20053030;
             int predecessor = ReadDynamicInt(info!, "PrePurchaseId");
             if (predecessor > 0 && session.player.PurchaseBuyTimes.GetValueOrDefault((uint)predecessor) == 0) return 20053008;
-            if (ReadIds(info!, "MutexPurchaseIds").Any(id => session.player.PurchaseBuyTimes.GetValueOrDefault((uint)id) > 0))
+            if (ReadIds(info!, "MutexPurchaseIds").Any(id => session.player.PurchaseDailyPasses.ContainsKey((uint)id)
+                    ? RemainingDays(session.player, (uint)id) > 0
+                    : session.player.PurchaseBuyTimes.GetValueOrDefault((uint)id) > 0))
                 return 20053101;
             if (!info!.TryGetValue("ConsumeId", out dynamic? rawConsumeId) || rawConsumeId is null
                 || !info.TryGetValue("ConsumeCount", out dynamic? rawConsumeCount) || rawConsumeCount is null
                 || HasValue(info, "PayKey") || HasValue(info, "PayKeySuffix")
-                || HasValue(info, "SelectDataForClient") || HasValue(info, "DailyRewardGoodsList")
-                || HasValue(info, "ClientResetInfo") || HasValue(info, "FirstRewardGoods")
-                || HasValue(info, "ExtraRewardGoods") || HasValue(info, "NormalDiscounts")
+                || HasValue(info, "SelectDataForClient") || HasValue(info, "NormalDiscounts")
                 || ReadDynamicInt(info, "SignInId") > 0)
                 return 20053031;
             int consumeId = ReadDynamicInt(info, "ConsumeId"), unitCost = ReadDynamicInt(info, "ConsumeCount");
@@ -235,9 +264,27 @@ namespace AscNet.GameServer.Handlers
                 || (long)unitCost * request.Count > int.MaxValue) return 20053031;
             cost = checked(unitCost * request.Count);
             if (cost > (session.inventory.Items.FirstOrDefault(item => item.Id == consumeId)?.Count ?? 0)) return 20012004;
-            try { goods = ReadPurchaseRewards(info, request.Count); }
+            try
+            {
+                goods = ReadPurchaseRewards(info, request.Count);
+                AddBonusRewards(info, session.player.PurchaseBuyTimes.GetValueOrDefault(request.Id) == 0, request.Count, goods);
+                int company = ReadDynamicInt(info, "CompanyPackage");
+                if (company > 0)
+                {
+                    if (!TryFindPurchaseInfo((uint)company, null, out var companion)) return 20053001;
+                    goods.AddRange(ReadPurchaseRewards(companion!, checked(request.Count * ReadDynamicInt(info, "CompanyPackageCount"))));
+                }
+                PlayerPendingPurchase preview = new();
+                PreparePassUpdates(session.player, info, request.Count, preview);
+            }
             catch (OverflowException) { return 20053031; }
-            if (goods.Count == 0 || goods.Any(reward => reward.Count <= 0 || !Enum.IsDefined(typeof(RewardType), reward.RewardType)))
+            catch (PurchaseLimitException error)
+            {
+                session.log.Warn($"Purchase limit: package={request.Id}, {error.Message}");
+                return 20053005;
+            }
+            catch (InvalidOperationException) { return 20053031; }
+            if ((goods.Count == 0 && !HasValue(info, "PurchaseSignInInfo")) || goods.Any(reward => reward.Count <= 0 || !Enum.IsDefined(typeof(RewardType), reward.RewardType)))
                 return 20053031;
             return 0;
         }
@@ -369,7 +416,7 @@ namespace AscNet.GameServer.Handlers
         [RequestPacketHandler("PayInitiatedRequest")]
         public static void PayInitiatedRequestHandler(Session session, Packet.Request packet)
         {
-            session.SendResponse(new PayInitiatedResponse() { Code = 1 }, packet.Id);
+            CompleteLocalRecharge(session, packet);
         }
     }
 }

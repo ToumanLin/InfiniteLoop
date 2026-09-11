@@ -181,7 +181,7 @@ enum WorkResult {
         build: Option<LocalBuild>,
         package: Option<PatchPackage>,
         patch: Option<PatchState>,
-        fps: Option<i32>,
+        fps: Result<Option<i32>>,
         update: Result<Option<bool>>,
         automatic: bool,
     },
@@ -618,7 +618,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     (m.busy, m.runtime.is_some())
                 };
                 if busy {
-                    show_fatal("Wait for the current operation to finish before closing.");
+                    MessageBoxW(hwnd, w!("Wait for the current operation to finish before closing."), w!("AscNet Launcher"), MB_OK | MB_ICONINFORMATION);
                     return LRESULT(0);
                 }
                 if has_runtime {
@@ -1706,8 +1706,8 @@ fn start_refresh(hwnd: HWND, check_remote: bool, automatic: bool) {
                 _ => None,
             };
             let fps = match &game {
-                Some(game) if crate::steam::valid_game_directory(game) => fps::inspect(game)?,
-                _ => None,
+                Some(game) if crate::steam::valid_game_directory(game) => fps::inspect(game),
+                _ => Ok(None),
             };
             let update = if check_remote {
                 local::check_update(&config.repository_url, &config.branch, build.as_ref())
@@ -1962,6 +1962,7 @@ unsafe fn finish_work(hwnd: HWND, state: &mut Window, work: Work) {
     m.busy = false;
     let mut automatic_prepare = false;
     let mut source_status = None;
+    let mut fps_warning = None;
     let log = match &work.result {
         Ok(WorkResult::LauncherChecked(_)) => "Launcher check complete",
         Ok(WorkResult::Refresh { .. }) => "Check complete",
@@ -2018,7 +2019,15 @@ unsafe fn finish_work(hwnd: HWND, state: &mut Window, work: Work) {
             m.build = build;
             m.package = package;
             m.patch = patch;
-            m.fps = Some(fps);
+            m.fps = match fps {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    let message = format!("FPS inspection unavailable: {error:#}");
+                    let _ = local::launcher_log(&message);
+                    fps_warning = Some(message);
+                    None
+                }
+            };
             match update {
                 Ok(value) => {
                     m.update_available = value;
@@ -2069,7 +2078,7 @@ unsafe fn finish_work(hwnd: HWND, state: &mut Window, work: Work) {
             return;
         }
         Err(e) => {
-            let message = local::logged_error(&format!("{e:#}"));
+            let message = format!("{e:#}");
             drop(m);
             append_log(hwnd, state, log);
             update_view(hwnd, &state.model);
@@ -2080,6 +2089,9 @@ unsafe fn finish_work(hwnd: HWND, state: &mut Window, work: Work) {
     drop(m);
     append_log(hwnd, state, log);
     if let Some(message) = source_status {
+        append_log(hwnd, state, &message);
+    }
+    if let Some(message) = fps_warning {
         append_log(hwnd, state, &message);
     }
     update_view(hwnd, &state.model);

@@ -24,6 +24,7 @@ const MAX_MSGPACK_DEPTH: usize = 64;
 
 #[derive(Clone)]
 struct Header {
+    version: u32,
     fields: usize,
     file_size: usize,
     info_compressed: usize,
@@ -41,6 +42,7 @@ struct Directory {
     plain: Vec<u8>,
     blocks: Vec<Block>,
     info_offset: usize,
+    data_offset: usize,
 }
 struct Decoded {
     header: Header,
@@ -130,15 +132,24 @@ fn resolve(game: &Path) -> Result<Active> {
         }
         let payload = decode(&read_bounded(&index)?)?.payload;
         if let Some(name) = matrix_name(&payload)? {
-            let path = root.join(name);
+            // The document catalog can reference an unchanged packaged asset.
+            // Keep its exact name; never fall back to an older resource catalog.
+            let mut asset_root = root.clone();
+            let mut asset_scope = scope;
+            let mut path = asset_root.join(&name);
+            if scope == "document" && matches!(fs::symlink_metadata(&path), Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+                asset_root = game.join("PGR_Data/StreamingAssets/resource/matrix");
+                asset_scope = "resource";
+                path = asset_root.join(&name);
+            }
             let canonical = fs::canonicalize(&path)
                 .with_context(|| format!("matrix bundle is missing: {}", path.display()))?;
-            if !canonical.starts_with(&root) || !canonical.is_file() {
+            if !canonical.starts_with(&asset_root) || !canonical.is_file() {
                 bail!("matrix index resolves outside its asset directory");
             }
             return Ok(Active {
                 path: canonical,
-                scope,
+                scope: asset_scope,
             });
         }
     }
@@ -159,7 +170,7 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>> {
 fn decode(data: &[u8]) -> Result<Decoded> {
     let header = header(data)?;
     let (directory, context) = directory(data, &header)?;
-    let start = align16(checked_add(directory.info_offset, header.info_compressed)?)?;
+    let start = directory.data_offset;
     let mut cursor = start;
     let total = directory
         .blocks
@@ -172,13 +183,14 @@ fn decode(data: &[u8]) -> Result<Decoded> {
     for (index, block) in directory.blocks.iter().enumerate() {
         let end = checked_add(cursor, block.compressed)?;
         let mut compressed = slice(data, cursor, end)?.to_vec();
-        if matches!(block.flags & 0x3f, 2 | 3) {
+        if header.flags & 0x1000 != 0 && matches!(block.flags & 0x3f, 2 | 3) {
             transform_controls(&mut compressed, &context, index, false)?;
         }
         payload.extend(decompress(&compressed, block.flags & 0x3f, block.plain)?);
         cursor = end;
     }
-    if cursor != data.len() {
+    let data_end = if header.flags & 0x80 != 0 { directory.info_offset } else { data.len() };
+    if cursor != data_end {
         bail!("unexpected UnityFS trailing bytes");
     }
     Ok(Decoded {
@@ -194,6 +206,7 @@ fn header(data: &[u8]) -> Result<Header> {
     if signature != b"UnityFS" {
         bail!("not a UnityFS bundle");
     }
+    let version = be_u32(data, offset)?;
     offset = checked_add(offset, 4)?;
     (_, offset) = cstring(data, offset)?;
     (_, offset) = cstring(data, offset)?;
@@ -207,10 +220,8 @@ fn header(data: &[u8]) -> Result<Header> {
     if file_size != data.len() || info_compressed == 0 || info_plain > MAX_BUNDLE_SIZE as usize {
         bail!("invalid UnityFS size fields");
     }
-    if flags & 0x80 != 0 {
-        bail!("UnityFS directory-at-end layout is unsupported");
-    }
     Ok(Header {
+        version,
         fields,
         file_size,
         info_compressed,
@@ -222,19 +233,32 @@ fn header(data: &[u8]) -> Result<Header> {
 
 fn directory(data: &[u8], header: &Header) -> Result<(Directory, [u8; 32])> {
     if header.flags & 0x1000 == 0 {
-        bail!("matrix bundle is not PGR-protected UnityFS");
+        let start = if header.version >= 7 { align16(header.header_size)? } else { header.header_size };
+        let info_offset = if header.flags & 0x80 != 0 {
+            header.file_size.checked_sub(header.info_compressed).context("invalid directory offset")?
+        } else { start };
+        if info_offset < start { bail!("UnityFS directory overlaps header"); }
+        let end = checked_add(info_offset, header.info_compressed)?;
+        let plain = decompress(slice(data, info_offset, end)?, (header.flags & 0x3f) as u16, header.info_plain)?;
+        let blocks = parse_directory(&plain)?;
+        let mut data_offset = if header.flags & 0x80 != 0 { start } else { end };
+        if header.flags & 0x200 != 0 { data_offset = align16(data_offset)?; }
+        return Ok((Directory { plain, blocks, info_offset, data_offset }, [0; 32]));
     }
-    let protected_start = if header.flags & 0x80 != 0 {
-        header
-            .file_size
-            .checked_sub(header.info_compressed)
-            .context("invalid directory offset")?
-    } else if header.flags & 0x400 != 0 {
+    let protected_start = if header.flags & 0x400 != 0 {
         align16(header.header_size)?
     } else {
         header.header_size
     };
     let (metadata_end, context) = protected_metadata(data, protected_start)?;
+    if header.flags & 0x80 != 0 {
+        let info_offset = header.file_size.checked_sub(header.info_compressed).context("invalid directory offset")?;
+        let data_offset = align16(metadata_end)?;
+        if info_offset < data_offset { bail!("UnityFS directory overlaps protection metadata"); }
+        let plain = decompress(&data[info_offset..], (header.flags & 0x3f) as u16, header.info_plain)?;
+        let blocks = parse_directory(&plain)?;
+        return Ok((Directory { plain, blocks, info_offset, data_offset }, context));
+    }
     for skip in 0..16usize {
         let start = checked_add(metadata_end, skip)?;
         let end = checked_add(start, header.info_compressed)?;
@@ -251,6 +275,7 @@ fn directory(data: &[u8], header: &Header) -> Result<(Directory, [u8; 32])> {
                     plain,
                     blocks,
                     info_offset: start,
+                    data_offset: align16(end)?,
                 },
                 context,
             ));
@@ -568,7 +593,7 @@ fn rewrite(
         .get_mut(content_offset..end)
         .context("replacement exceeds payload")?
         .copy_from_slice(&replacement);
-    let data_start = align16(decoded.directory.info_offset + decoded.header.info_compressed)?;
+    let data_start = decoded.directory.data_offset;
     let mut cursor = data_start;
     let mut logical = 0usize;
     let mut compressed = Vec::with_capacity(decoded.directory.blocks.len());
@@ -577,7 +602,7 @@ fn rewrite(
         let old = slice(original, cursor, old_end)?;
         let plain_end = checked_add(logical, block.plain)?;
         let changed = slice(&decoded.payload, logical, plain_end)?;
-        let unpacked = if matches!(block.flags & 0x3f, 2 | 3) {
+        let unpacked = if decoded.header.flags & 0x1000 != 0 && matches!(block.flags & 0x3f, 2 | 3) {
             transform_copy(old, &decoded.context, index)?
         } else {
             old.to_vec()
@@ -590,7 +615,9 @@ fn rewrite(
                 bail!("changed UnityFS block is not LZ4");
             }
             let mut packed = lz4_flex::block::compress(changed);
-            transform_controls(&mut packed, &decoded.context, index, true)?;
+            if decoded.header.flags & 0x1000 != 0 {
+                transform_controls(&mut packed, &decoded.context, index, true)?;
+            }
             compressed.push(packed);
         }
         cursor = old_end;
@@ -607,18 +634,26 @@ fn rewrite(
             .copy_from_slice(&size.to_be_bytes());
     }
     let info = lz4_flex::block::compress(&decoded.directory.plain);
-    let new_start = align16(decoded.directory.info_offset + info.len())?;
-    let mut output = original[..decoded.directory.info_offset].to_vec();
-    output.extend(&info);
-    output.resize(new_start, 0);
-    for block in compressed {
-        output.extend(block);
+    let mut output;
+    if decoded.header.flags & 0x80 != 0 {
+        output = original[..data_start].to_vec();
+        for block in compressed { output.extend(block); }
+        output.extend(&info);
+    } else {
+        output = original[..decoded.directory.info_offset].to_vec();
+        output.extend(&info);
+        if decoded.header.flags & (0x1000 | 0x200) != 0 {
+            output.resize(align16(output.len())?, 0);
+        }
+        for block in compressed { output.extend(block); }
     }
     let size = u64::try_from(output.len())?;
     let info_size = u32::try_from(info.len())?;
     output[decoded.header.fields..decoded.header.fields + 8].copy_from_slice(&size.to_be_bytes());
     output[decoded.header.fields + 8..decoded.header.fields + 12]
         .copy_from_slice(&info_size.to_be_bytes());
+    let flags = (decoded.header.flags & !0x3f) | 2;
+    output[decoded.header.fields + 16..decoded.header.fields + 20].copy_from_slice(&flags.to_be_bytes());
     let verified = decode(&output)?;
     let (_, content) = text_asset(&verified.payload)?;
     if content != replacement {
@@ -895,6 +930,106 @@ fn le_u32(data: &[u8], at: usize) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plain_bundle(payload: &[u8], flags: u32) -> Vec<u8> {
+        let packed = lz4_flex::block::compress(payload);
+        let mut info = vec![0; 16];
+        info.extend(1u32.to_be_bytes());
+        info.extend((payload.len() as u32).to_be_bytes());
+        info.extend((packed.len() as u32).to_be_bytes());
+        info.extend(2u16.to_be_bytes());
+        info.extend(0u32.to_be_bytes());
+        let info_plain = info.len();
+        if flags & 0x3f != 0 { info = lz4_flex::block::compress(&info); }
+        let mut data = b"UnityFS\0\0\0\0\x08\x35.x.x\x002022.3.52f1c1\0".to_vec();
+        let fields = data.len();
+        data.extend(0u64.to_be_bytes());
+        data.extend((info.len() as u32).to_be_bytes());
+        data.extend((info_plain as u32).to_be_bytes());
+        data.extend(flags.to_be_bytes());
+        data.resize(align16(data.len()).unwrap(), 0);
+        if flags & 0x80 != 0 {
+            data.extend(packed);
+            data.extend(info);
+        } else {
+            data.extend(info);
+            if flags & 0x200 != 0 { data.resize(align16(data.len()).unwrap(), 0); }
+            data.extend(packed);
+        }
+        let size = data.len() as u64;
+        data[fields..fields + 8].copy_from_slice(&size.to_be_bytes());
+        data
+    }
+
+    #[test]
+    fn plain_front_and_tail_directories_round_trip() {
+        let mut payload = (TEXT_ASSET.len() as u32).to_le_bytes().to_vec();
+        payload.extend(TEXT_ASSET);
+        payload.resize(align4(payload.len()).unwrap(), 0);
+        payload.extend(4u32.to_le_bytes());
+        let content = payload.len();
+        payload.extend(b"test");
+        payload.extend(b"unrelated asset must remain identical");
+        for flags in [0x40, 0x42, 0x242, 0xc2, 0x2c2] {
+            let original = plain_bundle(&payload, flags);
+            let decoded = decode(&original).unwrap();
+            assert_eq!(decoded.payload, payload);
+            let output = rewrite(&original, decoded, content, b"edit".to_vec()).unwrap();
+            let mut expected = payload.clone();
+            expected[content..content + 4].copy_from_slice(b"edit");
+            assert_eq!(decode(&output).unwrap().payload, expected);
+            assert_eq!(header(&output).unwrap().flags & 0x80, flags & 0x80);
+            let mut truncated = original.clone();
+            truncated.pop();
+            assert!(decode(&truncated).is_err());
+        }
+    }
+
+    #[test]
+    fn document_catalog_resolves_exact_packaged_asset() {
+        let game = std::env::temp_dir().join(format!("ascnet-fps-{}", Uuid::new_v4()));
+        let document = game.join("PGR_Data/StreamingAssets/document/matrix");
+        let resource = game.join("PGR_Data/StreamingAssets/resource/matrix");
+        fs::create_dir_all(&document).unwrap();
+        fs::create_dir_all(&resource).unwrap();
+        fs::write(game.join("PGR.exe"), []).unwrap();
+        let name = "current.uab";
+        let mut catalog = vec![0x93, 0x81, 0xa0 | LOGICAL_ASSET.len() as u8];
+        catalog.extend(LOGICAL_ASSET.as_bytes());
+        catalog.extend([0x91, 0xa0 | name.len() as u8]);
+        catalog.extend(name.as_bytes());
+        catalog.extend([0xc0, 0xc0]);
+        fs::write(document.join("index"), plain_bundle(&catalog, 0xc2)).unwrap();
+        fs::write(resource.join(name), b"asset").unwrap();
+        let active = resolve(&game).unwrap();
+        assert_eq!(active.scope, "resource");
+        assert_eq!(active.path, fs::canonicalize(resource.join(name)).unwrap());
+        fs::write(document.join(name), b"override").unwrap();
+        assert_eq!(resolve(&game).unwrap().scope, "document");
+        fs::remove_file(document.join(name)).unwrap();
+        fs::remove_file(resource.join(name)).unwrap();
+        fs::write(resource.join("old.uab"), b"stale").unwrap();
+        assert!(resolve(&game).is_err());
+        fs::remove_dir_all(game).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires ASCNET_TEST_GAME; reads installed assets, writes only in memory"]
+    fn installed_assets_inspect_and_rewrite_in_memory() {
+        let game = PathBuf::from(std::env::var_os("ASCNET_TEST_GAME").unwrap());
+        let active = resolve(&game).unwrap();
+        let original = read_bounded(&active.path).unwrap();
+        let decoded = decode(&original).unwrap();
+        let (offset, content) = text_asset(&decoded.payload).unwrap();
+        let mut replacement = content.to_vec();
+        // Exercise recompression without changing the serialized asset length.
+        replacement[0] ^= 1;
+        let mut expected = decoded.payload.clone();
+        expected[offset] ^= 1;
+        let output = rewrite(&original, decoded, offset, replacement).unwrap();
+        assert_eq!(decode(&output).unwrap().payload, expected);
+        println!("FPS inspection: {:?}; in-memory rewrite verified: {}", inspect(&game).unwrap(), active.path.display());
+    }
     #[test]
     fn malformed_hook_is_never_removed() {
         let text = "PgrNativeFpsTimer = somebody_else\n";

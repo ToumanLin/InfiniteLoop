@@ -3,13 +3,13 @@ use reqwest::Url;
 use serde::Deserialize;
 use std::{
     env, fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Mutex,
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -21,6 +21,53 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 static OPERATION: AtomicBool = AtomicBool::new(false);
 static LOG_WRITE: Mutex<()> = Mutex::new(());
+
+// Bound continuous output, including framework stdout/stderr, to three 5 MiB files.
+struct RotatingServerLog {
+    path: PathBuf,
+    file: Option<fs::File>,
+    size: u64,
+}
+impl RotatingServerLog {
+    const LIMIT: u64 = 5 * 1024 * 1024;
+    fn open(path: PathBuf) -> Result<Self> {
+        let file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let size = file.metadata()?.len();
+        Ok(Self { path, file: Some(file), size })
+    }
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.size + bytes.len() as u64 > Self::LIMIT {
+            self.file.take(); // Release the Windows file handle before renaming.
+            let one = self.path.with_extension("log.1");
+            let two = self.path.with_extension("log.2");
+            if two.exists() { fs::remove_file(&two)?; }
+            if one.exists() { fs::rename(&one, &two)?; }
+            fs::rename(&self.path, &one)?;
+            self.file = Some(fs::OpenOptions::new().create(true).append(true).open(&self.path)?);
+            self.size = 0;
+        }
+        self.file.as_mut().context("server log unavailable")?.write_all(bytes)?;
+        self.size += bytes.len() as u64;
+        Ok(())
+    }
+}
+fn capture_server_log(mut stream: impl Read + Send + 'static, log: Arc<Mutex<RotatingServerLog>>) {
+    thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        let mut reported_error = false;
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(length) => {
+                    // Continue draining the pipe even if disk logging fails, so the server cannot deadlock.
+                    if let Err(error) = log.lock().unwrap_or_else(|e| e.into_inner()).write(&buffer[..length]) {
+                        if !reported_error { eprintln!("server log write failed: {error}"); reported_error = true; }
+                    }
+                }
+            }
+        }
+    });
+}
 
 struct LauncherLog {
     path: PathBuf,
@@ -273,6 +320,25 @@ mod log_tests {
     use super::*;
 
     #[test]
+    fn server_log_rotates_and_retains_recent_output() {
+        let directory = env::temp_dir().join(format!("ascnet-rotate-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("server.log");
+        let mut log = RotatingServerLog::open(path.clone()).unwrap();
+        let block = vec![b'x'; 8192];
+        for _ in 0..(RotatingServerLog::LIMIT / 8192 * 4) { log.write(&block).unwrap(); }
+        log.write(b"latest error\n").unwrap();
+        drop(log);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 3);
+        for entry in fs::read_dir(&directory).unwrap() {
+            assert!(entry.unwrap().metadata().unwrap().len() <= RotatingServerLog::LIMIT);
+        }
+        assert!(fs::read(&path).unwrap().ends_with(b"latest error\n"));
+        for entry in fs::read_dir(&directory).unwrap() { fs::remove_file(entry.unwrap().path()).unwrap(); }
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
     fn failed_setup_retains_both_streams_across_attempts() {
         let directory = env::temp_dir().join(format!("ascnet-log-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&directory).unwrap();
@@ -471,10 +537,7 @@ impl LocalRuntime {
 
             progress("Starting AscNet server");
             let origin = format!("http://127.0.0.1:{}", build.sdk_port);
-            let server_log = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(root.join("logs/server.log"))?;
+            let server_log = Arc::new(Mutex::new(RotatingServerLog::open(root.join("logs/server.log"))?));
             let mut server = OwnedChild(
                 Command::new(&build.dotnet)
                     .arg(build.server_directory.join("AscNet.dll"))
@@ -485,12 +548,14 @@ impl LocalRuntime {
                     .env("ASCNET_GAME_BIND_ADDRESS", "127.0.0.1")
                     .env("ASCNET_MANAGED_STDIN", "1")
                     .stdin(Stdio::piped())
-                    .stdout(server_log.try_clone()?)
-                    .stderr(server_log)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
                     .creation_flags(CREATE_NO_WINDOW.0)
                     .spawn()
                     .context("start AscNet server")?,
             );
+            capture_server_log(server.0.stdout.take().context("capture server stdout")?, server_log.clone());
+            capture_server_log(server.0.stderr.take().context("capture server stderr")?, server_log);
             assign_to_job(&job, &server.0)?;
             wait_server(&mut server.0, &origin, build.game_port)?;
             progress("Local backend is ready");

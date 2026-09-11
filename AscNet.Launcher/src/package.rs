@@ -218,7 +218,7 @@ pub fn validate_server_origin(origin: &str) -> Result<String> {
 }
 
 pub fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = FsFile::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut file = open_file(path)?;
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
@@ -307,8 +307,17 @@ fn validate_hash(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn open_file(path: &Path) -> Result<FsFile> {
+    FsFile::open(path).with_context(|| format!("open {}", path.display()))
+        .map_err(|error| {
+            if error.downcast_ref::<std::io::Error>().is_some_and(|e| matches!(e.raw_os_error(), Some(225 | 226))) {
+                error.context("Windows Security blocked this patch file. Check Protection history for the detection details; repeating Setup will not resolve a security block")
+            } else { error }
+        })
+}
+
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
-    let file = FsFile::open(path).with_context(|| format!("open {}", path.display()))?;
+    let file = open_file(path)?;
     if file.metadata()?.len() > limit {
         bail!("{} exceeds size limit", path.display());
     }

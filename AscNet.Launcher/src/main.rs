@@ -34,6 +34,7 @@ fn main() {
         #[cfg(windows)]
         if env::args_os().len() == 1 {
             ui::show_fatal(&format!("{error:#}"));
+            std::process::exit(1);
         }
         eprintln!("{}", local::logged_error(&format!("{error:#}")));
         std::process::exit(1);

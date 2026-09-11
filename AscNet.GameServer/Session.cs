@@ -213,7 +213,7 @@ namespace AscNet.GameServer
                                         if (requestPacketHandler is not null)
                                         {
                                             // TODO: with new logger this will be unnecessary
-                                            if (Common.Common.config.VerboseLevel > VerboseLevel.Silent)
+                                            if (Common.Common.config.VerboseLevel >= VerboseLevel.Debug)
                                                 log.Info($"Request received: nameLength={request.Name?.Length ?? 0}, contentBytes={request.Content?.Length ?? 0}, id={request.Id}");
                                             InvokeRequestHandler(requestPacketHandler, request);
                                         }
@@ -502,7 +502,7 @@ namespace AscNet.GameServer
                 Type = Packet.ContentType.Response,
                 Content = MessagePackSerializer.Serialize(packet)
             });
-            if (Common.Common.config.VerboseLevel > VerboseLevel.Silent)
+            if (Common.Common.config.VerboseLevel > VerboseLevel.Silent && (packet.Name != "HeartbeatResponse" || Common.Common.config.VerboseLevel >= VerboseLevel.Debug))
                 log.Info($"{packet.Name}{(Common.Common.config.VerboseLevel >= VerboseLevel.Debug ? (", " + JsonConvert.SerializeObject(response)) : "")}");
         }
 

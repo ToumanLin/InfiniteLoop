@@ -48,6 +48,7 @@ internal partial class Program
         using MongoCollectionOverride mongo = MongoCollectionOverride.InstallForDailySignInCompatibility(
             out RecordingMongoCollectionProxy<Player> playerSaves, out _, out RecordingMongoCollectionProxy<Inventory> inventorySaves);
         using LoopbackSessionHarness harness = new(roster, player, inventory, "dorm-compat");
+        harness.Session.stage = CreateLoginAccountCompatibilityStage(playerId);
 
         Type dormModule = RequiredAscNetGameServerType("AscNet.GameServer.Handlers.DormModule");
         MethodInfo buildLoginData = RequiredMethod(dormModule, "BuildLoginData", BindingFlags.Static | BindingFlags.Public, [typeof(Session)]);
