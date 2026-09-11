@@ -119,6 +119,8 @@ internal partial class PayModule
 
     private static int GetDailyPackageDuration(Dictionary<dynamic, dynamic> info)
     {
+        int catalogDays = Catalog.Value.DailyRewardDays(ReadDynamicUInt(info, "Id"));
+        if (catalogDays > 0) return catalogDays;
         var configured = TableReaderV2.Parse<PurchaseDailyDurationTable>()
             .SingleOrDefault(row => row.Id == ReadDynamicUInt(info, "Id"));
         // Explicit local-server durations take precedence; monthly passes use

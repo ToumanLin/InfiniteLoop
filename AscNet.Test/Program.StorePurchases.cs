@@ -10,6 +10,7 @@ internal static partial class Program
 {
     private static void ValidateStorePurchases()
     {
+        ValidatePurchaseCatalog();
         using MongoCollectionOverride storage = MongoCollectionOverride.InstallForDailySignInCompatibility(
             out RecordingMongoCollectionProxy<Player> players,
             out RecordingMongoCollectionProxy<Character> characters,

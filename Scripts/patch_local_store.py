@@ -1,13 +1,15 @@
 """Prepare/apply a reversible local-recharge callback patch to the installed client.
 
-Requires UnityPy, pycryptodome and msgpack. Only XPayManager.lua changes;
-normal payment behavior remains in place unless the local server returns
-LocalCompleted=true. Preparation never modifies the installed game.
+Requires UnityPy, pycryptodome and msgpack. The optional --catalog patch adds
+reward-based missing-icon resolution and mutually exclusive ownership/status
+overlays. Existing local recharge patches are preserved. Preparation never
+modifies the installed game.
 """
 import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -16,6 +18,47 @@ import UnityPy
 
 MARKER = '-- AscNet local recharge completion'
 KEY = bytes.fromhex('587865636f6472506547616b61326536')
+CATALOG_MARKER = '-- AscNet server-owned purchase catalog icons'
+CATALOG_CALLERS = {
+    'XUiPurchaseLBListItem.lua': 'self.ItemData',
+    'XUiPurchaseCoatingLBListItem.lua': 'self.ItemData',
+    'XUiPurchaseBuyTips.lua': 'data',
+    'XUiPurchaseBundleGrid.lua': 'data',
+    'XUiPurchaseComboSubGrid.lua': 'data',
+    'XUiBigListGrid.lua': 'data',
+    'XUiChongzhiTanchuang.lua': 'data',
+    'XUiDrawPanelLbItem.lua': 'self.ItemData',
+    'XUiGridRegressionGift.lua': 'data',
+    'XUiMonthlyCardEn.lua': 'item.Data',
+    'XUiPanelRecommendComboPackageGrid.lua': 'data',
+    'XUiPanelRecommendEmojiItem.lua': 'package.Data',
+}
+
+
+def patch_catalog_lua(name, script):
+    newline = '\r\n' if '\r\n' in script else '\n'
+    if name == 'XPurchaseConfigs.lua':
+        if CATALOG_MARKER in script:
+            raise RuntimeError('Client already has the catalog patch; use a fresh output only for an unpatched bundle')
+        anchor = ('function XPurchaseConfigs.GetIconPathByIconName(iconName)\n'
+                  '    return PurchaseIconAssetPathConfig[iconName]\nend').replace('\n', newline)
+        if script.count(anchor) != 1:
+            raise RuntimeError('Purchase icon resolver changed; refusing an ambiguous patch')
+        replacement = Path(__file__).with_name('store_catalog_icons.lua').read_text(encoding='utf-8')
+        return script.replace(anchor, replacement.rstrip().replace('\n', newline))
+    if name in CATALOG_CALLERS:
+        owner = CATALOG_CALLERS[name]
+        anchor = f'XPurchaseConfigs.GetIconPathByIconName({owner}.Icon)'
+        if script.count(anchor) != 1:
+            raise RuntimeError(f'{name}: purchase icon call changed')
+        script = script.replace(anchor, f'XPurchaseConfigs.GetIconPathByIconName({owner}.Icon, {owner})')
+        if name in ('XUiPurchaseLBListItem.lua', 'XUiPurchaseCoatingLBListItem.lua'):
+            pattern = r'(?m)^([ \t]*)self\.ImgSellout\.gameObject:SetActive\(true\)'
+            script, count = re.subn(pattern, lambda match: match.group(0) + newline + match[1]
+                + 'if self.ImgHave then self.ImgHave.gameObject:SetActive(false) end', script)
+            if count != 4:
+                raise RuntimeError(f'{name}: expected four status transitions, found {count}')
+    return script
 
 
 def digest(data):
@@ -27,7 +70,9 @@ def text_assets(env):
             for obj in env.objects if obj.type.name == 'TextAsset'}
 
 
-def prepare(game, output):
+def prepare(game, output, catalog_patch=False):
+    if output.exists() and any(output.iterdir()):
+        raise RuntimeError('Output must be empty to preserve existing rollback backups')
     UnityPy.set_assetbundle_decrypt_key(KEY)
     base = game / 'PGR_Data' / 'StreamingAssets'
     index = UnityPy.load(str(base / 'document/matrix/index'))
@@ -39,15 +84,54 @@ def prepare(game, output):
     original = source.read_bytes()
     env = UnityPy.load(original)
     before = text_assets(env)
-    targets = [obj for obj in env.objects if obj.type.name == 'TextAsset' and obj.read().m_Name == 'XPayManager.lua']
-    if len(targets) != 1:
-        raise RuntimeError('Expected exactly one XPayManager.lua')
-    target = targets[0]
-    data = target.read()
-    if MARKER in data.m_Script:
-        raise RuntimeError('Client already has the local store patch')
+    target_names = {'XPayManager.lua'}
+    if catalog_patch:
+        target_names |= {'XPurchaseConfigs.lua', *CATALOG_CALLERS}
+    targets = [obj for obj in env.objects if obj.type.name == 'TextAsset' and obj.read().m_Name in target_names]
+    if len(targets) != len(target_names):
+        raise RuntimeError('Expected exactly one TextAsset for each store patch target')
+    changed = []
+    scripts = {}
+    for target in targets:
+        data = target.read()
+        previous = data.m_Script
+        if data.m_Name == 'XPayManager.lua':
+            data.m_Script = patch_recharge_lua(data.m_Script)
+        elif catalog_patch:
+            data.m_Script = patch_catalog_lua(data.m_Name, data.m_Script)
+        if data.m_Script != previous:
+            changed.append(target.path_id)
+            scripts[data.m_Name] = data.m_Script
+            data.save()
+    if not changed:
+        raise RuntimeError('No new patch to prepare')
+    patched = env.file.save(packer='lz4')
+    verified = UnityPy.load(patched)
+    after = text_assets(verified)
+    assert before.keys() == after.keys()
+    assert {key for key in before if before[key] != after[key]} == set(changed)
+    for obj in verified.objects:
+        if obj.path_id in changed:
+            data = obj.read()
+            assert data.m_Script == scripts[data.m_Name]
+    output.mkdir(parents=True, exist_ok=True)
+    (output / 'original.bundle').write_bytes(original)
+    (output / 'patched.bundle').write_bytes(patched)
+    for name, script in scripts.items():
+        (output / name.replace('.lua', '.patched.lua')).write_text(script, encoding='utf-8', newline='')
+    (output / 'manifest.json').write_text(json.dumps({
+        'source': str(source.resolve()), 'original_sha256': digest(original),
+        'patched_sha256': digest(patched), 'verified_text_assets': len(before),
+        'changed_scripts': sorted(scripts),
+    }, indent=2), encoding='utf-8')
+    print(f'Prepared and verified {len(changed)} changed Lua scripts among {len(before)} TextAssets: {output}')
+
+
+def patch_recharge_lua(script):
+    if MARKER in script:
+        return script
     anchor = '            DoPay(productKey, res.GameOrder, template.GoodsId)'
-    if data.m_Script.count(anchor) != 1:
+    if script.count(anchor) != 1:
         raise RuntimeError('Client callback changed; refusing an ambiguous patch')
     insertion = '''            -- AscNet local recharge completion
             if res.LocalCompleted then
@@ -57,25 +141,9 @@ def prepare(game, output):
                 return
             end
 '''
-    if '\r\n' in data.m_Script:
+    if '\r\n' in script:
         insertion = insertion.replace('\n', '\r\n')
-    data.m_Script = data.m_Script.replace(anchor, insertion + anchor)
-    data.save()
-    patched = env.file.save(packer='lz4')
-    verified = UnityPy.load(patched)
-    after = text_assets(verified)
-    assert before.keys() == after.keys()
-    assert [key for key in before if before[key] != after[key]] == [target.path_id]
-    assert MARKER in next(obj.read().m_Script for obj in verified.objects if obj.path_id == target.path_id)
-    output.mkdir(parents=True, exist_ok=True)
-    (output / 'original.bundle').write_bytes(original)
-    (output / 'patched.bundle').write_bytes(patched)
-    (output / 'XPayManager.patched.lua').write_text(data.m_Script, encoding='utf-8')
-    (output / 'manifest.json').write_text(json.dumps({
-        'source': str(source.resolve()), 'original_sha256': digest(original),
-        'patched_sha256': digest(patched), 'verified_text_assets': len(before),
-    }, indent=2), encoding='utf-8')
-    print(f'Prepared and verified one changed Lua script among {len(before)} TextAssets: {output}')
+    return script.replace(anchor, insertion + anchor)
 
 
 def apply(output, restore=False):
@@ -103,10 +171,11 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--apply', action='store_true')
     parser.add_argument('--restore', action='store_true')
+    parser.add_argument('--catalog', action='store_true', help='Add missing purchase icons and status overlay fixes')
     args = parser.parse_args()
     if args.apply or args.restore:
         apply(args.output, restore=args.restore)
     else:
         if args.game_dir is None:
             parser.error('--game-dir is required for preparation')
-        prepare(args.game_dir, args.output)
+        prepare(args.game_dir, args.output, args.catalog)

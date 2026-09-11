@@ -210,6 +210,23 @@ The runner sets:
 - `ASCNET_PROXY_TARGET`
 - `ASCNET_PROXY_LOG`
 
+## Rebuilding PGR-native-research
+
+`Scripts/export_native_research.py` reconstructs a research tree directly from the installed client. It reads the encrypted `StreamingAssets` index, extracts Lua `TextAsset`s, decodes supported BinaryTables into JSON and TSV, preserves unsupported table payloads as raw files, and can export referenced product textures as PNG. The client is never modified.
+
+The default extraction deliberately excludes unreferenced textures because the complete matrix is large:
+
+```powershell
+python Scripts\export_native_research.py `
+  --game-dir "C:\Program Files (x86)\Steam\steamapps\common\Punishing Gray Raven" `
+  --output "..\PGR-native-research-4.7.0" `
+  --version 4.7.0 `
+  --write-raw-tables `
+  --export-textures
+```
+
+The generated tree contains `PGR_DATA\en\lua`, decoded `bytes` JSON, matching `table` TSV files, raw unsupported table assets, referenced `assets` textures, `index.msgpack`, `version.json`, `manifest.json`, and `SHA256SUMS`. `--all-textures` is available for a complete indexed texture export and may require substantially more disk space. IL2CPP `dump.cs` remains an external Il2CppDumper/Cpp2IL step.
+
 ## Local account flow
 
 The runner can create or verify a local account before the client launches:
