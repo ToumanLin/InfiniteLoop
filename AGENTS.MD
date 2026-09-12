@@ -98,7 +98,9 @@ Focused harness switches are defined in `AscNet.Test/Program.cs`; `README.md` co
 - `launch-pgr-ascnet.sh` contains workstation-specific macOS/CrossOver paths; treat it as an example, not a portable default.
 
 ## Client dump and native research
-An authoritative client source of the 4.7.0 update is available at `C:\Users\Touma\Documents\My_PGR\PGR-native-research-4.7.0`
+An authoritative client source is available at:
+`C:\Users\Touma\Documents\My_PGR\PGR-native-research-4.7.0`: EN only, Use it for exact 4.7.0 client validation.
+`C:\Users\Touma\Documents\My_PGR\PGR-native-research`: CN/EN, is not version-pinned
 
 # Agent responses
 Keep your responses brief, terse  
