@@ -202,6 +202,7 @@ internal static partial class Program
             .GetMethod("AddSignInNotifications", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!
             .Invoke(null, new object[] { signNotify, player });
         AssertEqual(1, signNotify.PurchaseSignInInfoList.Count, "active sign-in included at login");
+        inventory.Items.Single(item => item.Id == firstItemReward.TemplateId).Count = 0;
         AssertEqual(0, Buy(1969).Code, "monthly companion bundle succeeds");
         AssertEqual(true, player.PurchaseDailyPasses.ContainsKey(83028), "companion bundle activates monthly pass");
         AssertEqual(30, LoginMonthlyRemaining(83028), "login includes purchased monthly renewal days");
@@ -259,6 +260,7 @@ internal static partial class Program
         AssertEqual(0, Claim(83028).RewardList.Count, "daily claim survives reload");
         ValidateFullMonthlyCombo();
         ValidateTenDayPackage();
+        ValidateBlackCardPoolPackagePurchases();
         Console.WriteLine("Store purchase/recharge compatibility checks passed.");
     }
 
@@ -338,5 +340,182 @@ internal static partial class Program
         harness.Session.player.PurchaseDailyPasses[9].LastClaimDay = day - 1;
         Refresh();
         AssertEqual(1, harness.Session.player.Mails.Count, "expired ten-day pass sends no further mail");
+    }
+
+    private static void ValidateBlackCardPoolPackagePurchases()
+    {
+        using MongoCollectionOverride storage = MongoCollectionOverride.InstallForDailySignInCompatibility(
+            out RecordingMongoCollectionProxy<Player> players,
+            out RecordingMongoCollectionProxy<Character> characters,
+            out RecordingMongoCollectionProxy<Inventory> inventories);
+        const uint SkillPack = 21;
+        long uid = 468700;
+        int packetId = 468700;
+        long skillPointMax = Inventory.GetMaxCount(
+            TableReaderV2.Parse<ItemTable>().Single(item => item.Id == Inventory.SkillPoint));
+        long Balance(Inventory inventory, int id) =>
+            inventory.Items.FirstOrDefault(item => item.Id == id)?.Count ?? 0;
+        PurchaseResponse Buy(LoopbackSessionHarness harness)
+        {
+            int sequence = packetId++;
+            InvokeRegisteredRequestHandler(nameof(PurchaseRequest), harness.Session, sequence,
+                new PurchaseRequest
+                {
+                    Id = SkillPack, Count = 1, DiscountId = -1, UiTypeList = [6],
+                    Param = new Dictionary<string, object> { ["FromMsg"] = 2 }
+                });
+            return ReadResponsePayload<PurchaseResponse>(harness, sequence, nameof(PurchaseResponse),
+                "black card pool purchase", maxPacketsToRead: 64);
+        }
+        foreach ((long paid, long free) in new[] { (10L, 0L), (5L, 5L), (0L, 10L) })
+        {
+            uid++;
+            Player player = CreateDrawCompatibilityPlayer(uid);
+            Inventory inventory = CreateDrawCompatibilityInventory(uid,
+            [
+                new Item { Id = Inventory.PaidGem, Count = paid },
+                new Item { Id = Inventory.FreeGem, Count = free }
+            ]);
+            using LoopbackSessionHarness harness = new(
+                CreateDrawCompatibilityCharacter(uid), player, inventory, $"pool-{paid}-{free}");
+            harness.Session.stage = CreateLoginAccountCompatibilityStage(uid);
+            AssertEqual(0, Buy(harness).Code, $"package 21 pooled balance {paid}/{free}");
+            AssertEqual(0L, Balance(inventory, Inventory.PaidGem), $"package 21 {paid}/{free} paid stack emptied");
+            AssertEqual(0L, Balance(inventory, Inventory.FreeGem), $"package 21 {paid}/{free} free stack emptied");
+            AssertEqual(5L, Balance(inventory, Inventory.SkillPoint), $"package 21 {paid}/{free} skill points granted");
+            AssertEqual(5000L, Balance(inventory, Inventory.Coin), $"package 21 {paid}/{free} cogs granted");
+            AssertEqual(1, player.PurchaseBuyTimes[SkillPack], $"package 21 {paid}/{free} counter recorded");
+            AssertEqual(null, player.PendingPurchase, $"package 21 {paid}/{free} pending cleared");
+            if (paid != 5 || free != 5)
+                continue;
+            // A durable receipt with retained pending intent resumes as a state refresh, never a second debit.
+            player.PendingPurchase = new PlayerPendingPurchase
+            {
+                Id = SkillPack, Count = 1, PreviousBuyTimes = 0,
+                BuyTime = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                ConsumeId = Inventory.FreeGem, ConsumeCount = 10,
+                Goods =
+                [
+                    new RewardGoods { Id = 900190, RewardType = (int)RewardType.Item, TemplateId = Inventory.SkillPoint, Count = 5 },
+                    new RewardGoods { Id = 900191, RewardType = (int)RewardType.Item, TemplateId = Inventory.Coin, Count = 5000 }
+                ]
+            };
+            inventory.Items.Single(item => item.Id == Inventory.SkillPoint).Count = skillPointMax - 2;
+            int retryPacket = packetId++;
+            InvokeRegisteredRequestHandler(nameof(PurchaseRequest), harness.Session, retryPacket,
+                new PurchaseRequest
+                {
+                    Id = SkillPack, Count = 1, DiscountId = -1, UiTypeList = [6],
+                    Param = new Dictionary<string, object> { ["FromMsg"] = 2 }
+                });
+            NotifyItemDataList retryPush = ReadItemPush(
+                harness.ReadPacket("pool claimed retry item push"), "pool claimed retry");
+            PurchaseResponse retry = ReadResponsePayload<PurchaseResponse>(
+                harness.ReadPacket("pool claimed retry response"), nameof(PurchaseResponse));
+            AssertEqual(0, retry.Code, "claimed pool retry succeeds despite full capacity");
+            AssertEqual(4, retryPush.ItemDataList.Count, "claimed retry pushes cost and reward stacks once");
+            AssertEqual(1, retryPush.ItemDataList.Count(entry => entry.Id == Inventory.PaidGem),
+                "claimed retry refreshes the paid Black Card stack once");
+            AssertEqual(1, retryPush.ItemDataList.Count(entry => entry.Id == Inventory.FreeGem),
+                "claimed retry refreshes the free Black Card stack once");
+            AssertEqual(0L, retryPush.ItemDataList.Single(entry => entry.Id == Inventory.PaidGem).Count,
+                "claimed retry paid stack stays empty");
+            AssertEqual(0L, retryPush.ItemDataList.Single(entry => entry.Id == Inventory.FreeGem).Count,
+                "claimed retry free stack stays empty");
+            AssertEqual(2, retry.RewardList.Count, "claimed retry echoes the reward list");
+            AssertEqual(skillPointMax - 2, Balance(inventory, Inventory.SkillPoint),
+                "claimed retry cannot double grant skill points");
+            AssertEqual(5000L, Balance(inventory, Inventory.Coin), "claimed retry cogs unchanged");
+            AssertEqual(1, player.PurchaseBuyTimes[SkillPack], "claimed retry keeps the counter");
+            AssertEqual(null, player.PendingPurchase, "claimed retry clears pending");
+        }
+        {
+            uid++;
+            Player player = CreateDrawCompatibilityPlayer(uid);
+            Inventory inventory = CreateDrawCompatibilityInventory(uid,
+            [
+                new Item { Id = Inventory.PaidGem, Count = 4 },
+                new Item { Id = Inventory.FreeGem, Count = 5 }
+            ]);
+            using LoopbackSessionHarness harness = new(
+                CreateDrawCompatibilityCharacter(uid), player, inventory, "pool-4-5");
+            harness.Session.stage = CreateLoginAccountCompatibilityStage(uid);
+            AssertEqual(20012004, Buy(harness).Code, "package 21 pooled 4/5 rejects as insufficient");
+            AssertEqual(4L, Balance(inventory, Inventory.PaidGem), "insufficient paid stack unchanged");
+            AssertEqual(5L, Balance(inventory, Inventory.FreeGem), "insufficient free stack unchanged");
+            AssertEqual(0L, Balance(inventory, Inventory.SkillPoint), "insufficient grants no skill points");
+            AssertEqual(0L, Balance(inventory, Inventory.Coin), "insufficient grants no cogs");
+            AssertEqual(false, player.PurchaseBuyTimes.ContainsKey(SkillPack), "insufficient writes no counter");
+            AssertEqual(null, player.PendingPurchase, "insufficient persists no pending intent");
+            AssertEqual(0, inventory.AppliedRewardClaims.Count, "insufficient writes no receipts");
+        }
+        {
+            uid++;
+            Player player = CreateDrawCompatibilityPlayer(uid);
+            Item skillPoints = new() { Id = Inventory.SkillPoint, Count = skillPointMax - 4 };
+            Inventory inventory = CreateDrawCompatibilityInventory(uid,
+            [
+                new Item { Id = Inventory.PaidGem, Count = 10 },
+                new Item { Id = Inventory.FreeGem, Count = 0 },
+                skillPoints
+            ]);
+            using LoopbackSessionHarness harness = new(
+                CreateDrawCompatibilityCharacter(uid), player, inventory, "pool-capacity");
+            harness.Session.stage = CreateLoginAccountCompatibilityStage(uid);
+            int receiptsBefore = inventory.AppliedRewardClaims.Count;
+            AssertEqual(20027011, Buy(harness).Code, "package 21 room 4 rejects immediate reward overflow");
+            AssertEqual(10L, Balance(inventory, Inventory.PaidGem), "capacity rejection keeps paid stack");
+            AssertEqual(0L, Balance(inventory, Inventory.FreeGem), "capacity rejection keeps free stack");
+            AssertEqual(skillPointMax - 4, Balance(inventory, Inventory.SkillPoint),
+                "capacity rejection grants no truncated skill points");
+            AssertEqual(0L, Balance(inventory, Inventory.Coin), "capacity rejection grants no cogs");
+            AssertEqual(false, player.PurchaseBuyTimes.ContainsKey(SkillPack), "capacity rejection writes no counter");
+            AssertEqual(null, player.PendingPurchase, "capacity rejection persists no pending intent");
+            AssertEqual(receiptsBefore, inventory.AppliedRewardClaims.Count, "capacity rejection writes no receipts");
+            skillPoints.Count = skillPointMax - 5;
+            AssertEqual(0, Buy(harness).Code, "package 21 room 5 grants in full");
+            AssertEqual(skillPointMax, Balance(inventory, Inventory.SkillPoint), "room 5 grants exactly five");
+            AssertEqual(5000L, Balance(inventory, Inventory.Coin), "room 5 grants cogs");
+            AssertEqual(0L, Balance(inventory, Inventory.PaidGem), "room 5 paid stack emptied");
+            AssertEqual(0L, Balance(inventory, Inventory.FreeGem), "room 5 free stack emptied");
+            AssertEqual(1, player.PurchaseBuyTimes[SkillPack], "room 5 records the counter");
+            AssertEqual(null, player.PendingPurchase, "room 5 clears pending");
+        }
+        {
+            uid++;
+            Player player = CreateDrawCompatibilityPlayer(uid);
+            Item skillPoints = new() { Id = Inventory.SkillPoint, Count = 0 };
+            Inventory inventory = CreateDrawCompatibilityInventory(uid,
+            [
+                new Item { Id = Inventory.PaidGem, Count = 10 },
+                new Item { Id = Inventory.FreeGem, Count = 0 },
+                skillPoints
+            ]);
+            using LoopbackSessionHarness harness = new(
+                CreateDrawCompatibilityCharacter(uid), player, inventory, "pool-resume");
+            harness.Session.stage = CreateLoginAccountCompatibilityStage(uid);
+            inventories.ThrowOnReplaceOne = true;
+            AssertEqual(2, Buy(harness).Code, "failed inventory save leaves the purchase pending");
+            inventories.ThrowOnReplaceOne = false;
+            AssertEqual(true, player.PendingPurchase is { Id: SkillPack }, "pending intent survives save failure");
+            AssertEqual(10L, Balance(inventory, Inventory.PaidGem), "failed save keeps paid stack");
+            AssertEqual(0, inventory.AppliedRewardClaims.Count, "failed save writes no receipts");
+            skillPoints.Count = skillPointMax - 4;
+            AssertEqual(20027011, Buy(harness).Code, "unreceipted resume rechecks capacity");
+            AssertEqual(true, player.PendingPurchase is { Id: SkillPack }, "blocked resume stays retryable");
+            AssertEqual(10L, Balance(inventory, Inventory.PaidGem), "blocked resume keeps paid stack");
+            AssertEqual(0L, Balance(inventory, Inventory.FreeGem), "blocked resume keeps free stack");
+            AssertEqual(skillPointMax - 4, Balance(inventory, Inventory.SkillPoint), "blocked resume grants nothing");
+            AssertEqual(0L, Balance(inventory, Inventory.Coin), "blocked resume grants no cogs");
+            AssertEqual(false, player.PurchaseBuyTimes.ContainsKey(SkillPack), "blocked resume writes no counter");
+            AssertEqual(0, inventory.AppliedRewardClaims.Count, "blocked resume writes no receipts");
+            skillPoints.Count = skillPointMax - 5;
+            AssertEqual(0, Buy(harness).Code, "resumed purchase completes once capacity frees");
+            AssertEqual(skillPointMax, Balance(inventory, Inventory.SkillPoint), "resumed purchase grants in full");
+            AssertEqual(0L, Balance(inventory, Inventory.PaidGem), "resumed purchase debits paid stack");
+            AssertEqual(0L, Balance(inventory, Inventory.FreeGem), "resumed purchase debits free stack");
+            AssertEqual(1, player.PurchaseBuyTimes[SkillPack], "resumed purchase records the counter");
+            AssertEqual(null, player.PendingPurchase, "resumed purchase clears pending");
+        }
     }
 }

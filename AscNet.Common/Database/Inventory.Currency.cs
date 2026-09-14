@@ -8,9 +8,10 @@ public partial class Inventory
     // Keep legacy constant names for compatibility with existing reward tables.
     public static bool IsBlackCard(int id) => id is PaidGem or FreeGem;
 
-    public long SpendableCount(int id) => Items
-        .Where(item => IsBlackCard(id) ? IsBlackCard(item.Id) : item.Id == id)
-        .Sum(item => item.Count);
+    public IEnumerable<Item> SpendableStacks(int id) => Items
+        .Where(item => IsBlackCard(id) ? IsBlackCard(item.Id) : item.Id == id);
+
+    public long SpendableCount(int id) => SpendableStacks(id).Sum(item => item.Count);
 
     public List<Item> Spend(int id, int amount)
     {

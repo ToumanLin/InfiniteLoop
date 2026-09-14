@@ -138,19 +138,26 @@ namespace AscNet.GameServer.Handlers
                             try { session.player.SaveChecked(); }
                             catch { session.player.PendingPurchase = null; throw; }
                         }
-                        RewardApplicationResult result = ResumePendingPurchase(session)!;
-                        // A later mail save must not turn an already committed purchase into a failed purchase.
-                        try { GrantMailDailyRewards(session); }
-                        catch (Exception error) { session.log.Error($"Daily purchase mail will retry on refresh: {error}"); }
-                        response.NewPurchaseInfoList = BuildPurchaseListResponse(request.UiTypeList, session.player).PurchaseInfoList;
-                        ApplyPurchaseState([info!], session.player);
-                        ReplacePurchaseInfo(response.NewPurchaseInfoList, info!);
-                        response.PurchaseInfo = info;
-                        response.RewardList = result.RewardGoods;
-                        result.SendPushes(session);
-                        if (TableReaderV2.Parse<WheelchairManualActivityTable>()
-                            .Any(activity => activity.ShowPackageIds.Contains((int)request.Id)))
-                            session.SendPush(WheelchairManualModule.BuildPayload(session, DateTimeOffset.UtcNow));
+                        RewardApplicationResult? result = ResumePendingPurchase(session, out int resumeCode);
+                        if (resumeCode != 0)
+                        {
+                            response.Code = resumeCode;
+                        }
+                        else
+                        {
+                            // A later mail save must not turn an already committed purchase into a failed purchase.
+                            try { GrantMailDailyRewards(session); }
+                            catch (Exception error) { session.log.Error($"Daily purchase mail will retry on refresh: {error}"); }
+                            response.NewPurchaseInfoList = BuildPurchaseListResponse(request.UiTypeList, session.player).PurchaseInfoList;
+                            ApplyPurchaseState([info!], session.player);
+                            ReplacePurchaseInfo(response.NewPurchaseInfoList, info!);
+                            response.PurchaseInfo = info;
+                            response.RewardList = result!.RewardGoods;
+                            result.SendPushes(session);
+                            if (TableReaderV2.Parse<WheelchairManualActivityTable>()
+                                .Any(activity => activity.ShowPackageIds.Contains((int)request.Id)))
+                                session.SendPush(WheelchairManualModule.BuildPayload(session, DateTimeOffset.UtcNow));
+                        }
                     }
                 }
                 catch (Exception exception)
@@ -163,16 +170,20 @@ namespace AscNet.GameServer.Handlers
             }
         }
 
-        public static RewardApplicationResult? ResumePendingPurchase(Session session)
+        public static RewardApplicationResult? ResumePendingPurchase(Session session, out int code)
         {
+            code = 0;
             PlayerPendingPurchase? pending = session.player.PendingPurchase;
             if (pending is null) return null;
             string key = $"purchase:{session.player.PlayerData.Id}:{pending.Id}:{pending.PreviousBuyTimes}";
-            List<RewardGoodsTable> rows = pending.Goods.Select(goods => new RewardGoodsTable
+            List<RewardGoodsTable> rows = ToRewardGoodsTable(pending.Goods);
+            if (!session.inventory.AppliedRewardClaims.Contains(key, StringComparer.Ordinal)
+                && !HasItemCapacity(session, rows))
             {
-                Id = goods.Id, TemplateId = goods.TemplateId, Count = goods.Count,
-                Params = goods.Level > 0 ? [goods.Level] : []
-            }).ToList();
+                session.log.Warn($"Purchase resume deferred: package={pending.Id} exceeds item capacity");
+                code = 20027011;
+                return null;
+            }
             RewardApplicationResult result = RewardHandler.ApplyRewardsOnceAndPersist(
                 [new RewardGrant(key, rows, pending.ConsumeCount > 0
                     ? new Dictionary<int, int> { [pending.ConsumeId] = pending.ConsumeCount } : null)], session);
@@ -246,7 +257,7 @@ namespace AscNet.GameServer.Handlers
             if (consumeId < 0 || unitCost < 0 || (unitCost > 0 && !Inventory.IsValidClientItemId(consumeId))
                 || (long)unitCost * request.Count > int.MaxValue) return 20053031;
             cost = checked(unitCost * request.Count);
-            if (cost > (session.inventory.Items.FirstOrDefault(item => item.Id == consumeId)?.Count ?? 0)) return 20012004;
+            if (cost > session.inventory.SpendableCount(consumeId)) return 20012004;
             try
             {
                 goods = ReadPurchaseRewards(info, request.Count);
@@ -270,6 +281,7 @@ namespace AscNet.GameServer.Handlers
             if ((goods.Count == 0 && !HasValue(info, "PurchaseSignInInfo") && !HasValue(info, "DailyRewardGoodsList"))
                 || goods.Any(reward => reward.Count <= 0 || !Enum.IsDefined(typeof(RewardType), reward.RewardType)))
                 return 20053031;
+            if (!HasItemCapacity(session, ToRewardGoodsTable(goods))) return 20027011;
             return 0;
         }
         public static bool IsPurchaseUnlocked(Session session, int purchaseId)

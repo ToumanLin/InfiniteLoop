@@ -197,6 +197,13 @@ internal partial class PayModule
         return result;
     }
 
+    private static List<RewardGoodsTable> ToRewardGoodsTable(IEnumerable<RewardGoods> goods) =>
+        goods.Select(g => new RewardGoodsTable
+        {
+            Id = g.Id, TemplateId = g.TemplateId, Count = g.Count,
+            Params = g.Level > 0 ? [g.Level] : []
+        }).ToList();
+
     private static bool HasItemCapacity(Session session, IEnumerable<RewardGoodsTable> goods)
     {
         foreach (IGrouping<int, RewardGoodsTable> group in goods
