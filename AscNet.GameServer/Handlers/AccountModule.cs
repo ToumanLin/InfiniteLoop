@@ -737,7 +737,7 @@ namespace AscNet.GameServer.Handlers
         {
             ItemModule.ResumePendingItemUse(session);
             ItemModule.ReconcileDailyAssetPurchaseCounts(session.inventory);
-            PayModule.ResumePendingPurchase(session);
+            PayModule.ResumePendingPurchase(session, out _);
             BiancaTheatreModule.PrepareLogin(session);
             GuildModule.PrepareLogin(session);
             GuildBossModule.PrepareLogin(session);
