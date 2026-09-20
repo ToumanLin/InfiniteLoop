@@ -701,15 +701,51 @@ class TestPgrUiActions(unittest.TestCase):
         )
         self.assertTrue(enter["calibrationSource"])
 
+        calibrated_photo_anchors = {
+            "main_terminal.bottom_bar_toggle": ((0.825521, 0.822917), (1268, 790)),
+            "main_terminal.camera_button": ((0.609635, 0.797917), (936, 766)),
+            "photograph.btn_hide": ((0.965104, 0.2575), (1482, 247)),
+            "photograph.btn_scene": ((0.965104, 0.342917), (1482, 329)),
+        }
+        for name, (normalized, _) in calibrated_photo_anchors.items():
+            with self.subTest(action=name):
+                entry = actions[name]
+                self.assertEqual(entry["status"], "calibrated")
+                self.assertEqual(
+                    (entry["anchor"]["x"], entry["anchor"]["y"]), normalized
+                )
+                self.assertIn("User-measured", entry["calibrationSource"])
+
         for name in expected - {
             "lobby.enter",
             "lobby.dismiss_neutral_top",
             "lobby.dismiss_left_margin",
             "lobby.dismiss_top_left",
+            *calibrated_photo_anchors,
         }:
             self.assertEqual(actions[name]["status"], "provisional", name)
             self.assertIsNone(actions[name]["anchor"], name)
             self.assertTrue(actions[name]["clientControl"], name)
+
+    def test_user_calibrated_photo_anchors_resolve_to_virtual_client(self) -> None:
+        driver, controller = create_standard_test_environment()
+        driver.foreground_hwnd = 5770964
+        expected = {
+            "main_terminal.bottom_bar_toggle": (1268, 790),
+            "main_terminal.camera_button": (936, 766),
+            "photograph.btn_hide": (1482, 247),
+            "photograph.btn_scene": (1482, 329),
+        }
+        for name, (x, y) in expected.items():
+            with self.subTest(action=name):
+                driver.recorded_actions.clear()
+                res = controller.action_invoke(name)
+                self.assertTrue(res["success"])
+                self.assertEqual(res["resolved_client"], {"space": "virtual", "x": x, "y": y})
+                self.assertEqual(res["verification"]["result"], "UNKNOWN")
+                clicks = self._mouse_clicks(driver)
+                self.assertEqual(len(clicks), 1)
+                self.assertEqual((clicks[0]["screen_x"], clicks[0]["screen_y"]), (x, y))
 
     def test_action_list_default_lists_only_calibrated(self) -> None:
         driver, controller = create_standard_test_environment()
@@ -721,7 +757,8 @@ class TestPgrUiActions(unittest.TestCase):
         self.assertFalse(res["include_provisional"])
         listed_names = [a["name"] for a in res["actions"]]
         self.assertIn("lobby.enter", listed_names)
-        self.assertNotIn("photograph.btn_hide", listed_names)
+        self.assertIn("photograph.btn_hide", listed_names)
+        self.assertNotIn("photograph.scene_list", listed_names)
         for entry in res["actions"]:
             self.assertEqual(entry["status"], "calibrated")
             self.assertTrue(entry["anchor_set"])
@@ -741,11 +778,11 @@ class TestPgrUiActions(unittest.TestCase):
         self.assertEqual(res["counts"]["listed"], res["counts"]["total"])
         self.assertIn("photograph.btn_hide", listed_names)
         self.assertIn("scene_setting.open", listed_names)
-        hide = next(
-            a for a in res["actions"] if a["name"] == "photograph.btn_hide"
+        scene_list = next(
+            a for a in res["actions"] if a["name"] == "photograph.scene_list"
         )
-        self.assertEqual(hide["status"], "provisional")
-        self.assertFalse(hide["anchor_set"])
+        self.assertEqual(scene_list["status"], "provisional")
+        self.assertFalse(scene_list["anchor_set"])
 
     def test_action_show_entries_and_unknown(self) -> None:
         driver, controller = create_standard_test_environment()
@@ -757,11 +794,11 @@ class TestPgrUiActions(unittest.TestCase):
         self.assertTrue(res["anchor_set"])
         self.assertFalse(res["provisional_opt_in_required"])
 
-        res_prov = controller.action_show("photograph.btn_scene")
+        res_prov = controller.action_show("photograph.scene_change_1")
         self.assertTrue(res_prov["success"])
         self.assertTrue(res_prov["provisional_opt_in_required"])
         self.assertFalse(res_prov["anchor_set"])
-        self.assertIn("BtnScene", res_prov["entry"]["clientControl"])
+        self.assertIn("BtnSceneChange1", res_prov["entry"]["clientControl"])
 
         res_missing = controller.action_show("no.such.action")
         self.assertFalse(res_missing["success"])
@@ -802,7 +839,7 @@ class TestPgrUiActions(unittest.TestCase):
         driver, controller = create_standard_test_environment()
         driver.foreground_hwnd = 5770964
 
-        res = controller.action_invoke("photograph.btn_hide")
+        res = controller.action_invoke("photograph.scene_change_1")
         self.assertFalse(res["success"])
         self.assertEqual(res["error"], "ACTION_PROVISIONAL")
         self.assertEqual(res["action_status"], "provisional")
@@ -813,7 +850,7 @@ class TestPgrUiActions(unittest.TestCase):
         driver.foreground_hwnd = 5770964
 
         res = controller.action_invoke(
-            "photograph.btn_hide", allow_provisional=True
+            "photograph.scene_change_1", allow_provisional=True
         )
         self.assertFalse(res["success"])
         self.assertEqual(res["error"], "ACTION_ANCHOR_UNSET")
@@ -1078,7 +1115,7 @@ class TestPgrUiActions(unittest.TestCase):
         buf = io.StringIO()
         with patch("sys.stdout", buf):
             code = main(
-                ["action", "invoke", "photograph.btn_hide"], driver=driver
+                ["action", "invoke", "photograph.scene_change_1"], driver=driver
             )
         self.assertEqual(code, 1)
         output = json.loads(buf.getvalue())
@@ -1340,7 +1377,7 @@ class TestPgrUiActions(unittest.TestCase):
         driver.foreground_hwnd = 5770964
 
         res = controller.action_invoke(
-            "photograph.btn_hide", allow_provisional=True
+            "photograph.scene_change_1", allow_provisional=True
         )
         self.assertFalse(res["success"])
         self.assertEqual(res["error"], "ACTION_ANCHOR_UNSET")

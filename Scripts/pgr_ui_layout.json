@@ -41,32 +41,36 @@
     "main_terminal.bottom_bar_toggle": {
       "description": "Main terminal right-panel bottom bar toggle; route step toward the camera button.",
       "clientControl": "XUiMainTerminal right-panel bottom bar",
-      "anchor": null,
-      "status": "provisional",
+      "anchor": {"type": "normalized_point", "x": 0.825521, "y": 0.822917},
+      "status": "calibrated",
+      "calibrationSource": "User-measured physical-client XYWH Rect(1328,953,514,69), tilted 6 degrees clockwise, on 2026-09-20; center (1585,987.5) normalized against 1920x1200. Anchor measured; UI effect not independently verified.",
       "dispatch": {"type": "click"},
       "verification": {"kind": "none"}
     },
     "main_terminal.camera_button": {
       "description": "Main terminal right-panel bottom bar camera button; opens the photograph UI.",
       "clientControl": "XUiMainTerminal:OnBtnScreenShotClick -> XLuaUiManager.Open(\"UiPhotograph\")",
-      "anchor": null,
-      "status": "provisional",
+      "anchor": {"type": "normalized_point", "x": 0.609635, "y": 0.797917},
+      "status": "calibrated",
+      "calibrationSource": "User-measured physical-client XYWH Rect(1107,900,127,115) on 2026-09-20; center (1170.5,957.5) normalized against 1920x1200. Anchor measured; UI effect not independently verified.",
       "dispatch": {"type": "click"},
       "verification": {"kind": "none"}
     },
     "photograph.btn_hide": {
       "description": "Photograph panel eye icon; hides all other UI.",
       "clientControl": "XUiPhotographPanel.BtnHide -> OnBtnHideClick/UpdateViewState",
-      "anchor": null,
-      "status": "provisional",
+      "anchor": {"type": "normalized_point", "x": 0.965104, "y": 0.2575},
+      "status": "calibrated",
+      "calibrationSource": "User-measured physical-client XYWH Rect(1811,269,84,80) on 2026-09-20; center (1853,309) normalized against 1920x1200. Anchor measured; UI effect not independently verified.",
       "dispatch": {"type": "click"},
       "verification": {"kind": "none"}
     },
     "photograph.btn_scene": {
       "description": "Photograph panel scene icon; opens the scene-change panel.",
       "clientControl": "XUiPhotographPanel.BtnScene -> XUiPanelPhotographSceneChange",
-      "anchor": null,
-      "status": "provisional",
+      "anchor": {"type": "normalized_point", "x": 0.965104, "y": 0.342917},
+      "status": "calibrated",
+      "calibrationSource": "User-measured physical-client XYWH Rect(1811,368,84,87) on 2026-09-20; center (1853,411.5) normalized against 1920x1200. Anchor measured; day/night selection mapping not yet verified.",
       "dispatch": {"type": "click"},
       "verification": {"kind": "none"}
     },
@@ -95,7 +99,7 @@
       "verification": {"kind": "none"}
     },
     "photograph.scene_list": {
-      "description": "Scene-setting scrollable list region.",
+      "description": "Scene-setting scrollable list region: user-measured physical-client XYWH Rect(242,149,391,925) at 1920x1200. This is a region, not a verified one-click action; scrolling is not yet supported by the named-action CLI.",
       "clientControl": "XUiSceneSettingMain (GetSceneIdList/SortSceneIdList/ChangeDisplay)",
       "anchor": null,
       "status": "provisional",

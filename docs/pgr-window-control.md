@@ -249,14 +249,27 @@ The loader is strict and fails closed: a missing file is `LAYOUT_NOT_FOUND`; wro
 
 **`--layout PATH`:** overrides the default layout (intended for local calibration fixtures under ignored paths). The override is validated with exactly the same rules; there is no relaxed mode.
 
+**Photo-mode calibration (user-measured on a 1920×1200 physical client, 2026-09-20):** The rectangles below are physical-client `Rect(x,y,width,height)`, while `action invoke` still resolves the center to the CLI's virtual client pixels. The bar rectangle is tilted about 6° clockwise; its geometric center is the anchor. Calibration means the position was measured, **not** that the click's semantic effect was verified. Capture and inspect the state after each action.
+
+| Action or region | Physical XYWH | Virtual click at 1536×960 | Status |
+|---|---:|---:|---|
+| `main_terminal.bottom_bar_toggle` | `(1328,953,514,69)` | `(1268,790)` | Calibrated center |
+| `main_terminal.camera_button` | `(1107,900,127,115)` | `(936,766)` | Calibrated center |
+| `photograph.btn_hide` (eye) | `(1811,269,84,80)` | `(1482,247)` | Calibrated center |
+| `photograph.btn_scene` | `(1811,368,84,87)` | `(1482,329)` | Calibrated center |
+| `photograph.scene_list` scroll region | `(242,149,391,925)` | — | Region only; no one-click anchor or scroll command |
+
+Each invocation performs at most one guarded click. For the user-confirmed route, invoke the bottom-bar toggle, verify a screenshot, invoke the camera button, verify the scene list and eye/scene icons, then invoke the eye button and verify that other UI is hidden. `photograph.btn_scene` opens the scene-change control; **which choice selects day or night remains UNKNOWN**. Do not batch these commands or infer an effect from `success:true` alone.
+
 **Route vocabulary & support matrix (as shipped):**
 
 | Status | Actions | Basis |
 |---|---|---|
 | `calibrated` | `lobby.enter` (0.5, 0.5); `lobby.dismiss_neutral_top` (0.5, 0.208); `lobby.dismiss_left_margin` (0.039, 0.5); `lobby.dismiss_top_left` (0.052, 0.083) | Observed working in the 2026-09-20 activation run (virtual 1536x960 normalized). The `dismiss_*` targets are neutral tap points; which element each dismissed is unverified. |
-| `provisional` (anchor unset) | `main_terminal.bottom_bar_toggle`, `main_terminal.camera_button` (`XUiMainTerminal:OnBtnScreenShotClick`), `photograph.btn_hide` (`XUiPhotographPanel.BtnHide` eye icon), `photograph.btn_scene` (`XUiPhotographPanel.BtnScene`), `photograph.scene_change_1..3` (`XUiPanelPhotographSceneChange.BtnSceneChange1/2/3`), `photograph.scene_list` (`XUiSceneSettingMain`), `scene_setting.open` (`OpenUiSceneSetting`) | Client Lua names are known; **no live coordinates have been calibrated**. The day/night/mode mapping of the numbered scene-change buttons is UNVERIFIED. |
+| `calibrated` (user-measured anchor) | `main_terminal.bottom_bar_toggle`, `main_terminal.camera_button`, `photograph.btn_hide`, `photograph.btn_scene` | User-supplied physical rectangles above; normalized centers stored in `pgr_ui_layout.json`. Effects must still be checked by screenshot. |
+| `provisional` (anchor unset) | `photograph.scene_change_1..3` (`XUiPanelPhotographSceneChange.BtnSceneChange1/2/3`), `photograph.scene_list` (`XUiSceneSettingMain`), `scene_setting.open` (`OpenUiSceneSetting`) | Day/night mapping and these click targets remain unverified. The scene-list rectangle is a measured scroll **region**, not a calibrated click. |
 
-**Explicit limitation:** beyond the `lobby.*` entries above, no live controls are calibrated — every `main_terminal`/`photograph`/`scene_setting` anchor awaits an interactive calibration pass against the fixed full-frame `screenshot` on an unlocked workstation. Until then, invoking them is impossible (`ACTION_ANCHOR_UNSET`) rather than approximate. Nothing in this surface reads in-process UI state or confirms effects; `UNKNOWN` is never promoted to a success claim.
+**Explicit limitation:** the four photo-route anchors above are based on the user's measurements, not a CLI-verified state transition. `scene_change_1..3`, the scene-list scroll interaction, and `scene_setting.open` remain gated/unset. Nothing in this surface reads in-process UI state or confirms effects; `UNKNOWN` is never promoted to a success claim.
 
 ---
 
