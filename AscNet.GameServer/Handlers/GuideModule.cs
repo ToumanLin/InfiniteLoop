@@ -281,11 +281,18 @@ namespace AscNet.GameServer.Handlers
         {
             player.PlayerData.GuideData ??= new();
             HashSet<long> completedGuides = new(player.PlayerData.GuideData);
+            bool changed = false;
             foreach (GuideGroupTable guide in GuideGroups.Value.Values.Where(guide => guide.Ignore == 0 && guide.RewardId == 0))
             {
                 if (completedGuides.Add(guide.Id))
+                {
                     player.PlayerData.GuideData.Add(guide.Id);
+                    changed = true;
+                }
             }
+
+            if (changed)
+                player.SaveChecked();
         }
 
         private static bool IsValidGuide(int guideGroupId)

@@ -1,4 +1,4 @@
 {
-  "SkipCommonGuides": false,
+  "SkipCommonGuides": true,
   "VerboseLevel": "Debug"
 }

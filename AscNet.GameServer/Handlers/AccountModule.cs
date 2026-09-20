@@ -851,7 +851,7 @@ namespace AscNet.GameServer.Handlers
             }
         }
 
-        private static List<int> BuildHaveBackgroundIds(Player player)
+        internal static List<int> BuildHaveBackgroundIds(Player player)
         {
             HashSet<int> backgroundIds = TableReaderV2.Parse<BackgroundTable>()
                 .Where(background => background.Id > 0 && background.IsFree > 0)

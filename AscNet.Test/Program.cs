@@ -29045,26 +29045,43 @@ namespace AscNet.Test
                 "SkipCommonGuides",
                 BindingFlags.Static | BindingFlags.NonPublic,
                 [typeof(AscNet.Common.Database.Player)]);
-            skipCommonGuides.Invoke(null, [player]);
+            using (MongoCollectionOverride skipOverride =
+                   MongoCollectionOverride.InstallForDailySignInCompatibility(
+                       out RecordingMongoCollectionProxy<AscNet.Common.Database.Player> skipPlayerSaves,
+                       out _,
+                       out _))
+            {
+                skipCommonGuides.Invoke(null, [player]);
 
-            List<long> actualGuideData = player.PlayerData.GuideData
-                ?? throw new InvalidDataException("GuideModule.SkipCommonGuides cleared GuideData.");
-            HashSet<long> actualGuideIds = actualGuideData.ToHashSet();
-            if (!actualGuideIds.SetEquals(expectedSkippedGuideIds))
-                throw new InvalidDataException("GuideModule.SkipCommonGuides: expected all and only non-ignored, rewardless GuideGroupTable ids plus the existing marker.");
-            if (!actualGuideIds.Contains(existingGuideMarker))
-                throw new InvalidDataException("GuideModule.SkipCommonGuides: existing guide marker was not preserved.");
-            if (actualGuideIds.Overlaps(ignoredGuideIds))
-                throw new InvalidDataException("GuideModule.SkipCommonGuides: added an ignored GuideGroupTable id.");
-            if (actualGuideIds.Overlaps(rewardBearingGuideIds))
-                throw new InvalidDataException("GuideModule.SkipCommonGuides: added a reward-bearing GuideGroupTable id.");
-            if (actualGuideData.Count != actualGuideIds.Count)
-                throw new InvalidDataException("GuideModule.SkipCommonGuides: added duplicate guide markers.");
+                List<long> actualGuideData = player.PlayerData.GuideData
+                    ?? throw new InvalidDataException("GuideModule.SkipCommonGuides cleared GuideData.");
+                HashSet<long> actualGuideIds = actualGuideData.ToHashSet();
+                if (!actualGuideIds.SetEquals(expectedSkippedGuideIds))
+                    throw new InvalidDataException("GuideModule.SkipCommonGuides: expected all and only non-ignored, rewardless GuideGroupTable ids plus the existing marker.");
+                if (!actualGuideIds.Contains(existingGuideMarker))
+                    throw new InvalidDataException("GuideModule.SkipCommonGuides: existing guide marker was not preserved.");
+                if (actualGuideIds.Overlaps(ignoredGuideIds))
+                    throw new InvalidDataException("GuideModule.SkipCommonGuides: added an ignored GuideGroupTable id.");
+                if (actualGuideIds.Overlaps(rewardBearingGuideIds))
+                    throw new InvalidDataException("GuideModule.SkipCommonGuides: added a reward-bearing GuideGroupTable id.");
+                if (actualGuideData.Count != actualGuideIds.Count)
+                    throw new InvalidDataException("GuideModule.SkipCommonGuides: added duplicate guide markers.");
 
-            long[] firstPassGuideData = actualGuideData.ToArray();
-            skipCommonGuides.Invoke(null, [player]);
-            if (!player.PlayerData.GuideData.SequenceEqual(firstPassGuideData))
-                throw new InvalidDataException("GuideModule.SkipCommonGuides: second invocation was not idempotent.");
+                AssertEqual(1, skipPlayerSaves.ReplaceOneCalls,
+                    "GuideModule.SkipCommonGuides persists appended guides once");
+                AscNet.Common.Database.Player persistedSkipPlayer =
+                    MongoDB.Bson.Serialization.BsonSerializer.Deserialize<AscNet.Common.Database.Player>(
+                        skipPlayerSaves.LastReplacement!.ToBson());
+                if (!persistedSkipPlayer.PlayerData.GuideData.ToHashSet().SetEquals(expectedSkippedGuideIds))
+                    throw new InvalidDataException("GuideModule.SkipCommonGuides: persisted guide ids differ from in-memory state.");
+
+                long[] firstPassGuideData = actualGuideData.ToArray();
+                skipCommonGuides.Invoke(null, [player]);
+                if (!player.PlayerData.GuideData.SequenceEqual(firstPassGuideData))
+                    throw new InvalidDataException("GuideModule.SkipCommonGuides: second invocation was not idempotent.");
+                AssertEqual(1, skipPlayerSaves.ReplaceOneCalls,
+                    "GuideModule.SkipCommonGuides skips persistence when no guides were appended");
+            }
             HashSet<int> guideCompletionIds = TableReaderV2.Parse<GuideCompleteTable>()
                 .Select(guideCompletion => guideCompletion.Id)
                 .ToHashSet();
