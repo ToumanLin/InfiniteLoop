@@ -69,6 +69,19 @@ SM_YVIRTUALSCREEN = 77
 SM_CXVIRTUALSCREEN = 78
 SM_CYVIRTUALSCREEN = 79
 
+# Thread DPI awareness context pseudo-handle values (winuser.h). These are
+# passed to SetThreadDpiAwarenessContext; the function returns the previous
+# opaque context value which must be passed back verbatim to restore it.
+DPI_AWARENESS_CONTEXT_UNAWARE = -1
+DPI_AWARENESS_CONTEXT_SYSTEM_AWARE = -2
+DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE = -3
+DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED = -5
+
+
+class PhysicalRectUnavailableError(RuntimeError):
+    """Raised when reliable physical client-rectangle measurement is unavailable."""
+
 INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
 INPUT_HARDWARE = 2
@@ -270,6 +283,107 @@ class Win32Driver:
     def grab_screen(self, bbox: Tuple[int, int, int, int]) -> Any:
         raise NotImplementedError
 
+    def supports_thread_dpi_awareness_context(self) -> bool:
+        """True if SetThreadDpiAwarenessContext is available (Win10 1703+)."""
+        raise NotImplementedError
+
+    def set_thread_dpi_awareness_context(self, context: int) -> int:
+        """Applies a DPI awareness context to the calling thread.
+
+        Returns the previous opaque context value (pass it back to restore),
+        or 0 if the call failed.
+        """
+        raise NotImplementedError
+
+    def get_dpi_for_window(self, hwnd: int) -> int:
+        """Returns the DPI of the window's display, or 0 if unavailable."""
+        raise NotImplementedError
+
+    def get_system_metrics(self, index: int) -> int:
+        raise NotImplementedError
+
+    def get_physical_client_rect(self, hwnd: int) -> Dict[str, Any]:
+        """Measures a window's client rectangle in physical device pixels.
+
+        A DPI-unaware process receives virtualized (scaled-down) coordinates
+        from GetClientRect/ClientToScreen/GetSystemMetrics, while Pillow's
+        ImageGrab consumes physical device pixels. Feeding virtualized rects
+        to ImageGrab produces a literal top-left crop of the frame. To obtain
+        the physical rectangle this method temporarily raises the calling
+        thread's DPI awareness to a per-monitor context, measures, and then
+        restores the prior context in all cases.
+
+        Returns a dict with the physical client screen rect (left/top/right/
+        bottom/width/height), the window dpi, the awareness context used, and
+        the physical virtual-screen bounds used for containment validation.
+
+        Raises PhysicalRectUnavailableError when the awareness-context API is
+        missing or rejects a per-monitor context; in that case no reliable
+        physical measurement exists and callers must fail closed. Any other
+        exception propagates after the context is restored.
+        """
+        if not self.supports_thread_dpi_awareness_context():
+            raise PhysicalRectUnavailableError(
+                "SetThreadDpiAwarenessContext is unavailable on this system; "
+                "physical client rect measurement is impossible."
+            )
+
+        previous_context = 0
+        context_name = ""
+        for context_value, name in (
+            (
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+                "PER_MONITOR_AWARE_V2",
+            ),
+            (
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
+                "PER_MONITOR_AWARE",
+            ),
+        ):
+            previous_context = self.set_thread_dpi_awareness_context(
+                context_value
+            )
+            if previous_context:
+                context_name = name
+                break
+        if not previous_context:
+            raise PhysicalRectUnavailableError(
+                "SetThreadDpiAwarenessContext rejected per-monitor awareness "
+                "contexts; physical client rect measurement is impossible."
+            )
+
+        try:
+            c_left, c_top, c_right, c_bottom = self.get_client_rect(hwnd)
+            s_left, s_top = self.client_to_screen(hwnd, 0, 0)
+            vs_left = self.get_system_metrics(SM_XVIRTUALSCREEN)
+            vs_top = self.get_system_metrics(SM_YVIRTUALSCREEN)
+            vs_width = self.get_system_metrics(SM_CXVIRTUALSCREEN)
+            vs_height = self.get_system_metrics(SM_CYVIRTUALSCREEN)
+            dpi = self.get_dpi_for_window(hwnd)
+        finally:
+            self.set_thread_dpi_awareness_context(previous_context)
+
+        width = c_right - c_left
+        height = c_bottom - c_top
+        return {
+            "left": s_left,
+            "top": s_top,
+            "right": s_left + width,
+            "bottom": s_top + height,
+            "width": width,
+            "height": height,
+            "dpi": dpi,
+            "dpi_awareness_context": context_name,
+            "virtual_screen": {
+                "left": vs_left,
+                "top": vs_top,
+                "right": vs_left + vs_width,
+                "bottom": vs_top + vs_height,
+                "width": vs_width,
+                "height": vs_height,
+            },
+        }
+
 
 class LiveWin32Driver(Win32Driver):
     """Production Win32 driver backed by user32 and kernel32."""
@@ -420,6 +534,18 @@ class LiveWin32Driver(Win32Driver):
 
         self.kernel32.GetCurrentThreadId.restype = wintypes.DWORD
         self.kernel32.GetCurrentThreadId.argtypes = []
+
+        # DPI-awareness APIs are only present on Windows 10 1607+/1703+.
+        # Configure signatures only when the exports exist so the driver can
+        # still be constructed on older systems and fail closed later.
+        if hasattr(self.user32, "SetThreadDpiAwarenessContext"):
+            self.user32.SetThreadDpiAwarenessContext.restype = ctypes.c_ssize_t
+            self.user32.SetThreadDpiAwarenessContext.argtypes = [
+                ctypes.c_ssize_t
+            ]
+        if hasattr(self.user32, "GetDpiForWindow"):
+            self.user32.GetDpiForWindow.restype = wintypes.UINT
+            self.user32.GetDpiForWindow.argtypes = [wintypes.HWND]
 
     def open_input_desktop(self) -> Any:
         # DESKTOP_READOBJECTS | DESKTOP_ENUMERATE. Enumeration does not require
@@ -605,6 +731,24 @@ class LiveWin32Driver(Win32Driver):
             )
         return ImageGrab.grab(bbox=bbox, all_screens=True)
 
+    def supports_thread_dpi_awareness_context(self) -> bool:
+        return hasattr(self.user32, "SetThreadDpiAwarenessContext")
+
+    def set_thread_dpi_awareness_context(self, context: int) -> int:
+        func = getattr(self.user32, "SetThreadDpiAwarenessContext", None)
+        if func is None:
+            return 0
+        return int(func(context) or 0)
+
+    def get_dpi_for_window(self, hwnd: int) -> int:
+        func = getattr(self.user32, "GetDpiForWindow", None)
+        if func is None:
+            return 0
+        return int(func(hwnd))
+
+    def get_system_metrics(self, index: int) -> int:
+        return int(self.user32.GetSystemMetrics(index))
+
 
 class FakeWindow:
     """Mock window representation for unit tests."""
@@ -621,6 +765,9 @@ class FakeWindow:
         window_rect: Tuple[int, int, int, int] = (0, 0, 1536, 960),
         client_rect: Tuple[int, int, int, int] = (0, 0, 1536, 960),
         client_origin: Tuple[int, int] = (0, 0),
+        physical_client_rect: Optional[Tuple[int, int, int, int]] = None,
+        physical_client_origin: Optional[Tuple[int, int]] = None,
+        dpi: int = 96,
     ) -> None:
         self.hwnd = hwnd
         self.pid = pid
@@ -632,6 +779,20 @@ class FakeWindow:
         self.window_rect = window_rect
         self.client_rect = client_rect
         self.client_origin = client_origin
+        # Physical (device-pixel) geometry reported while the calling thread
+        # holds a per-monitor DPI awareness context. Defaults to the virtual
+        # geometry, modeling a 96-DPI (100%) display.
+        self.physical_client_rect = (
+            physical_client_rect
+            if physical_client_rect is not None
+            else client_rect
+        )
+        self.physical_client_origin = (
+            physical_client_origin
+            if physical_client_origin is not None
+            else client_origin
+        )
+        self.dpi = dpi
         self.children: Dict[int, int] = {}
         self.text: str = title
 
@@ -655,6 +816,33 @@ class FakeWin32Driver(Win32Driver):
         self.pillow_available: bool = True
         self.recorded_actions: List[Dict[str, Any]] = []
         self.submit_count: int = 0
+
+        # DPI-awareness simulation. The CLI starts DPI-unaware; while the
+        # thread context is a per-monitor value, rect/metric getters report
+        # the physical geometry of a window instead of the virtualized one.
+        self.thread_dpi_awareness_context: int = DPI_AWARENESS_CONTEXT_UNAWARE
+        self.dpi_context_api_available: bool = True
+        self.raise_during_aware_measurement: bool = False
+        self.virtual_screen_virtual: Tuple[int, int, int, int] = (
+            0,
+            0,
+            1536,
+            960,
+        )
+        self.virtual_screen_physical: Tuple[int, int, int, int] = (
+            0,
+            0,
+            1920,
+            1200,
+        )
+        self.grabbed_size_override: Optional[Tuple[int, int]] = None
+
+    def _aware_physical(self) -> bool:
+        """True when the simulated thread context yields physical pixels."""
+        return self.thread_dpi_awareness_context in (
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        )
 
     def open_input_desktop(self) -> Any:
         return 12345
@@ -714,13 +902,22 @@ class FakeWin32Driver(Win32Driver):
         return win.window_rect if win else (0, 0, 0, 0)
 
     def get_client_rect(self, hwnd: int) -> Tuple[int, int, int, int]:
+        if self.raise_during_aware_measurement and self._aware_physical():
+            raise RuntimeError("Simulated failure during physical measurement")
         win = self.windows.get(hwnd)
-        return win.client_rect if win else (0, 0, 0, 0)
+        if not win:
+            return (0, 0, 0, 0)
+        if self._aware_physical():
+            return win.physical_client_rect
+        return win.client_rect
 
     def client_to_screen(self, hwnd: int, x: int, y: int) -> Tuple[int, int]:
         win = self.windows.get(hwnd)
         if win:
-            ox, oy = win.client_origin
+            if self._aware_physical():
+                ox, oy = win.physical_client_origin
+            else:
+                ox, oy = win.client_origin
             return (ox + x, oy + y)
         return (x, y)
 
@@ -937,12 +1134,61 @@ class FakeWin32Driver(Win32Driver):
         if self.foreground_race_during_screenshot:
             self.foreground_hwnd = 99999
 
+        self.recorded_actions.append(
+            {"action": "grab_screen", "bbox": tuple(bbox)}
+        )
+
+        width, height = self.grabbed_size_override or (
+            bbox[2] - bbox[0],
+            bbox[3] - bbox[1],
+        )
+
         # Return a mock PIL Image object
         class FakeImage:
+            def __init__(self, w: int, h: int) -> None:
+                self.size = (w, h)
+
             def save(self, path: str, format: str = "PNG") -> None:
                 Path(path).write_bytes(b"\x89PNG\r\n\x1a\nfake_image_bytes")
 
-        return FakeImage()
+        return FakeImage(width, height)
+
+    def supports_thread_dpi_awareness_context(self) -> bool:
+        return self.dpi_context_api_available
+
+    def set_thread_dpi_awareness_context(self, context: int) -> int:
+        if not self.dpi_context_api_available:
+            return 0
+        previous = self.thread_dpi_awareness_context
+        self.recorded_actions.append(
+            {
+                "action": "set_thread_dpi_awareness_context",
+                "context": context,
+                "previous": previous,
+            }
+        )
+        self.thread_dpi_awareness_context = context
+        return previous
+
+    def get_dpi_for_window(self, hwnd: int) -> int:
+        win = self.windows.get(hwnd)
+        return win.dpi if win else 0
+
+    def get_system_metrics(self, index: int) -> int:
+        left, top, width, height = (
+            self.virtual_screen_physical
+            if self._aware_physical()
+            else self.virtual_screen_virtual
+        )
+        metrics = {
+            SM_XVIRTUALSCREEN: left,
+            SM_YVIRTUALSCREEN: top,
+            SM_CXVIRTUALSCREEN: width,
+            SM_CYVIRTUALSCREEN: height,
+            SM_CXSCREEN: width,
+            SM_CYSCREEN: height,
+        }
+        return metrics.get(index, 0)
 
 
 # -----------------------------------------------------------------------------
@@ -1280,6 +1526,59 @@ class PgrWindowController:
                 "message": f"Game window client dimensions are non-positive: {c_rect['width']}x{c_rect['height']}.",
             }
 
+        # Measure the client rectangle in physical device pixels. This CLI is
+        # DPI-unaware, so the client_rect above is virtualized (e.g. 1536x960
+        # at 125% scaling) while ImageGrab interprets bbox in physical pixels
+        # (1920x1200). Feeding the virtual rect produces a literal top-left
+        # crop of the frame; the physical rect is required for full coverage.
+        try:
+            phys = self.driver.get_physical_client_rect(game_hwnd)
+        except PhysicalRectUnavailableError as e:
+            return {
+                "success": False,
+                "error": "PHYSICAL_RECT_UNAVAILABLE",
+                "message": str(e),
+                "target_hwnd": game_hwnd,
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": "PHYSICAL_RECT_UNAVAILABLE",
+                "message": f"Physical client rect measurement failed: {e}",
+                "target_hwnd": game_hwnd,
+            }
+
+        if phys["width"] <= 0 or phys["height"] <= 0:
+            return {
+                "success": False,
+                "error": "INVALID_CLIENT_DIMENSIONS",
+                "message": (
+                    f"Game window physical client dimensions are non-positive: "
+                    f"{phys['width']}x{phys['height']}."
+                ),
+                "target_hwnd": game_hwnd,
+            }
+
+        vs = phys["virtual_screen"]
+        if (
+            phys["left"] < vs["left"]
+            or phys["top"] < vs["top"]
+            or phys["right"] > vs["right"]
+            or phys["bottom"] > vs["bottom"]
+        ):
+            return {
+                "success": False,
+                "error": "CLIENT_RECT_OFFSCREEN",
+                "message": (
+                    f"Physical client rect ({phys['left']},{phys['top']},"
+                    f"{phys['right']},{phys['bottom']}) is not fully contained "
+                    f"in the physical virtual screen ({vs['left']},{vs['top']},"
+                    f"{vs['right']},{vs['bottom']}); capture would be clipped."
+                ),
+                "client_rect_physical": phys,
+                "target_hwnd": game_hwnd,
+            }
+
         # Check foreground before
         fg_before = self.driver.get_foreground_window()
         fg_valid = fg_before == game_hwnd or (
@@ -1306,10 +1605,10 @@ class PgrWindowController:
         out_file.parent.mkdir(parents=True, exist_ok=True)
 
         bbox = (
-            c_rect["left"],
-            c_rect["top"],
-            c_rect["right"],
-            c_rect["bottom"],
+            phys["left"],
+            phys["top"],
+            phys["right"],
+            phys["bottom"],
         )
 
         try:
@@ -1339,6 +1638,31 @@ class PgrWindowController:
                 "target_hwnd": game_hwnd,
             }
 
+        # Fail closed if the returned image does not cover the full physical
+        # client rect; never write a partial or mis-sized PNG.
+        img_size = getattr(img, "size", None)
+        if not img_size or tuple(img_size) != (phys["width"], phys["height"]):
+            return {
+                "success": False,
+                "error": "CAPTURE_SIZE_MISMATCH",
+                "message": (
+                    f"Captured image size {tuple(img_size) if img_size else 'unknown'} "
+                    f"does not match physical client size "
+                    f"({phys['width']}, {phys['height']}). Capture rejected."
+                ),
+                "expected_size": {
+                    "width": phys["width"],
+                    "height": phys["height"],
+                },
+                "actual_size": (
+                    {"width": img_size[0], "height": img_size[1]}
+                    if img_size
+                    else None
+                ),
+                "client_rect_physical": phys,
+                "target_hwnd": game_hwnd,
+            }
+
         try:
             img.save(str(out_file), format="PNG")
         except Exception as e:
@@ -1353,6 +1677,11 @@ class PgrWindowController:
             "output_path": str(out_file),
             "target_hwnd": game_hwnd,
             "client_rect": c_rect,
+            "client_rect_virtual": c_rect,
+            "client_rect_physical": phys,
+            "image_size": {"width": img_size[0], "height": img_size[1]},
+            "dpi": phys["dpi"] or None,
+            "coordinate_space": "device",
             "race_limitation_warning": (
                 "Win32 screen capture samples visible screen pixels. While game "
                 "foreground was verified immediately before and after capture, "

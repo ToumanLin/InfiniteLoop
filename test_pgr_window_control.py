@@ -12,6 +12,8 @@ import unittest
 from unittest.mock import patch
 
 from Scripts.pgr_window_control import (
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    DPI_AWARENESS_CONTEXT_UNAWARE,
     FakeWin32Driver,
     FakeWindow,
     PgrWindowController,
@@ -33,7 +35,8 @@ def create_standard_test_environment() -> Tuple[FakeWin32Driver, PgrWindowContro
     driver.processes[pgr_pid] = pgr_path
     driver.processes[1234] = r"C:\Windows\explorer.exe"
 
-    # Game Window
+    # Game Window. Models the live 125%-DPI machine: the DPI-unaware CLI sees
+    # a virtualized 1536x960 client, while the physical client is 1920x1200.
     game_win = FakeWindow(
         hwnd=5770964,
         pid=pgr_pid,
@@ -45,6 +48,9 @@ def create_standard_test_environment() -> Tuple[FakeWin32Driver, PgrWindowContro
         window_rect=(0, 0, 1536, 960),
         client_rect=(0, 0, 1536, 960),
         client_origin=(0, 0),
+        physical_client_rect=(0, 0, 1920, 1200),
+        physical_client_origin=(0, 0),
+        dpi=120,
     )
 
     # KRSDK Main Window
@@ -231,6 +237,149 @@ class TestPgrWindowControl(unittest.TestCase):
         self.assertIn("race_limitation_warning", res)
         # Cleanup
         out_path.unlink()
+
+    def test_screenshot_uses_physical_client_bbox_and_reports_fields(self) -> None:
+        driver, controller = create_standard_test_environment()
+        driver.foreground_hwnd = 5770964
+        driver.pillow_available = True
+
+        out_path = Path(".runtime") / "test_screenshot_physical.png"
+        if out_path.exists():
+            out_path.unlink()
+
+        res = controller.screenshot(output_path=str(out_path))
+        self.assertTrue(res["success"])
+
+        # The grab bbox must be the physical device-pixel rect (1920x1200),
+        # not the DPI-virtualized 1536x960 top-left crop.
+        grabs = [
+            a for a in driver.recorded_actions if a.get("action") == "grab_screen"
+        ]
+        self.assertEqual(len(grabs), 1)
+        self.assertEqual(grabs[0]["bbox"], (0, 0, 1920, 1200))
+
+        # Additive JSON contract: legacy virtual rect retained, physical rect
+        # and device-pixel metadata reported.
+        self.assertEqual(res["client_rect"]["width"], 1536)
+        self.assertEqual(res["client_rect"]["height"], 960)
+        self.assertEqual(res["client_rect_virtual"]["width"], 1536)
+        self.assertEqual(res["client_rect_physical"]["width"], 1920)
+        self.assertEqual(res["client_rect_physical"]["height"], 1200)
+        self.assertEqual(res["image_size"], {"width": 1920, "height": 1200})
+        self.assertEqual(res["dpi"], 120)
+        self.assertEqual(res["coordinate_space"], "device")
+
+        # The DPI-awareness context must be restored after measurement.
+        self.assertEqual(
+            driver.thread_dpi_awareness_context, DPI_AWARENESS_CONTEXT_UNAWARE
+        )
+        ctx_calls = [
+            a
+            for a in driver.recorded_actions
+            if a.get("action") == "set_thread_dpi_awareness_context"
+        ]
+        self.assertEqual(len(ctx_calls), 2)
+        self.assertEqual(
+            ctx_calls[0]["context"], DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        )
+        self.assertEqual(
+            ctx_calls[1]["context"], DPI_AWARENESS_CONTEXT_UNAWARE
+        )
+
+        out_path.unlink()
+
+    def test_screenshot_fails_on_capture_size_mismatch(self) -> None:
+        driver, controller = create_standard_test_environment()
+        driver.foreground_hwnd = 5770964
+        driver.pillow_available = True
+        # Simulate an under-delivered grab (e.g. clipped raster).
+        driver.grabbed_size_override = (1536, 960)
+
+        out_path = Path(".runtime") / "test_screenshot_mismatch.png"
+        if out_path.exists():
+            out_path.unlink()
+
+        res = controller.screenshot(output_path=str(out_path))
+        self.assertFalse(res["success"])
+        self.assertEqual(res["error"], "CAPTURE_SIZE_MISMATCH")
+        self.assertEqual(
+            res["expected_size"], {"width": 1920, "height": 1200}
+        )
+        self.assertEqual(res["actual_size"], {"width": 1536, "height": 960})
+        # A partial/mis-sized PNG must never be written.
+        self.assertFalse(out_path.exists())
+
+    def test_screenshot_fails_if_physical_rect_offscreen(self) -> None:
+        driver, controller = create_standard_test_environment()
+        driver.foreground_hwnd = 5770964
+        driver.pillow_available = True
+
+        # Partially off the left edge of the physical virtual screen.
+        driver.windows[5770964].physical_client_origin = (-100, 0)
+        res = controller.screenshot()
+        self.assertFalse(res["success"])
+        self.assertEqual(res["error"], "CLIENT_RECT_OFFSCREEN")
+
+        # Partially off the right edge (100 + 1920 > 1920 virtual width).
+        driver.windows[5770964].physical_client_origin = (100, 0)
+        res = controller.screenshot()
+        self.assertFalse(res["success"])
+        self.assertEqual(res["error"], "CLIENT_RECT_OFFSCREEN")
+
+        # Fully offscreen.
+        driver.windows[5770964].physical_client_origin = (5000, 0)
+        res = controller.screenshot()
+        self.assertFalse(res["success"])
+        self.assertEqual(res["error"], "CLIENT_RECT_OFFSCREEN")
+
+    def test_screenshot_fails_if_physical_measurement_unsupported(self) -> None:
+        driver, controller = create_standard_test_environment()
+        driver.foreground_hwnd = 5770964
+        driver.pillow_available = True
+        driver.dpi_context_api_available = False
+
+        res = controller.screenshot()
+        self.assertFalse(res["success"])
+        self.assertEqual(res["error"], "PHYSICAL_RECT_UNAVAILABLE")
+
+        grabs = [
+            a for a in driver.recorded_actions if a.get("action") == "grab_screen"
+        ]
+        self.assertEqual(len(grabs), 0)
+
+    def test_screenshot_restores_dpi_context_on_measurement_error(self) -> None:
+        driver, controller = create_standard_test_environment()
+        driver.foreground_hwnd = 5770964
+        driver.pillow_available = True
+        driver.raise_during_aware_measurement = True
+
+        res = controller.screenshot()
+        self.assertFalse(res["success"])
+        self.assertEqual(res["error"], "PHYSICAL_RECT_UNAVAILABLE")
+
+        # Prior thread context is restored even when measurement raised.
+        self.assertEqual(
+            driver.thread_dpi_awareness_context, DPI_AWARENESS_CONTEXT_UNAWARE
+        )
+        ctx_calls = [
+            a
+            for a in driver.recorded_actions
+            if a.get("action") == "set_thread_dpi_awareness_context"
+        ]
+        self.assertEqual(len(ctx_calls), 2)
+        self.assertEqual(
+            ctx_calls[-1]["context"], DPI_AWARENESS_CONTEXT_UNAWARE
+        )
+
+    def test_screenshot_fails_if_physical_dimensions_nonpositive(self) -> None:
+        driver, controller = create_standard_test_environment()
+        driver.foreground_hwnd = 5770964
+        driver.pillow_available = True
+        driver.windows[5770964].physical_client_rect = (0, 0, 0, 0)
+
+        res = controller.screenshot()
+        self.assertFalse(res["success"])
+        self.assertEqual(res["error"], "INVALID_CLIENT_DIMENSIONS")
 
     def test_click_fails_if_game_not_foreground_pre(self) -> None:
         driver, controller = create_standard_test_environment()

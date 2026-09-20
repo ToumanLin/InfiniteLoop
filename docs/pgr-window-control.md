@@ -24,7 +24,7 @@ Under the Windows Win32 User subsystem, certain operations cannot provide mathem
    - *Mitigation:* The CLI performs a strict `GetForegroundWindow()` verification immediately prior to `SendInput`, verifies coordinate bounds against `GetClientRect`, and performs a post-dispatch foreground verification. If the foreground window changes, the failure is reported immediately. The CLI **never performs an implicit click or key retry**.
 2. **Desktop Pixel Capture & Occlusion Races:**
    Win32 screen capture (`PIL.ImageGrab`) captures the visible screen raster within the specified bounding box. While window identity and dimensions are verified, Win32 does not provide atomic isolation against transparent topmost windows or rapid focus races between before/after checks.
-   - *Mitigation:* The CLI verifies that the game client is in the foreground and visible immediately before capture, computes the exact client rectangle via `ClientToScreen`, captures the frame, and re-verifies foreground state immediately after. If foreground changed during capture, the operation fails and the capture is rejected.
+   - *Mitigation:* The CLI verifies that the game client is in the foreground and visible immediately before capture, measures the exact client rectangle in physical device pixels (see §3.3), captures the frame, asserts the returned image covers the full rectangle, and re-verifies foreground state immediately after. If foreground changed during capture, the operation fails and the capture is rejected.
 
 ---
 
@@ -98,19 +98,44 @@ python Scripts/pgr_window_control.py focus [--target game|krsdk_main|krsdk_login
 ---
 
 ### 3.3 `screenshot`
-Captures the visible client area of `PGR.exe` as a PNG file.
+Captures the visible client area of `PGR.exe` as a PNG file in **physical device pixels**.
 
 ```bash
 python Scripts/pgr_window_control.py screenshot [--out .runtime/screenshots/my_capture.png] [--allow-krsdk-foreground]
 ```
 
+**Physical-frame contract (DPI correctness):**
+- This CLI is intentionally **DPI-unaware**, so `GetClientRect`/`ClientToScreen`/`GetSystemMetrics` return *virtualized* coordinates (e.g. `1536x960` on a 125%-scaled 1920x1200 display). `PIL.ImageGrab.grab(bbox=...)`, however, interprets `bbox` in **physical device pixels**. Feeding the virtualized rect to `ImageGrab` previously produced a literal top-left `1536x960` crop of the `1920x1200` frame, discarding the right and bottom 20% of every capture.
+- `screenshot` therefore measures the client rectangle via `Win32Driver.get_physical_client_rect()`: the calling thread temporarily adopts `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2` (falling back to `PER_MONITOR_AWARE` — both yield physical coordinates; `SYSTEM_AWARE` is *not* used because it can still rescale under mixed-DPI multi-monitor layouts), reads `GetClientRect`/`ClientToScreen`/virtual-screen metrics/`GetDpiForWindow`, and **always restores the prior thread context** afterwards, including on failure. Process DPI awareness is never changed globally, and no fixed scale factor is assumed.
+- The measured physical rect must have positive dimensions and lie **fully inside the physical virtual screen** (`SM_*VIRTUALSCREEN` read under the same aware context); otherwise the command fails closed (`INVALID_CLIENT_DIMENSIONS` / `CLIENT_RECT_OFFSCREEN`) rather than writing a clipped PNG.
+- After capture, `img.size` must equal the physical client size exactly; any deviation fails with `CAPTURE_SIZE_MISMATCH` and nothing is written.
+
 **Contract & Safety Guards:**
 - Requires `Pillow` (installed optional dependency; fails clearly with `DEPENDENCY_MISSING` if absent).
 - Requires `game` window (or KRSDK modal if `--allow-krsdk-foreground` is set) to be in the foreground *before* capture.
 - Verifies window visibility and non-minimized state.
-- Computes screen client coordinates using `ClientToScreen`.
+- Fails with `PHYSICAL_RECT_UNAVAILABLE` if a reliable physical measurement cannot be obtained (missing or rejected DPI-awareness API, measurement error).
 - Verifies foreground *immediately after* capture. If focus changed during capture, returns `FOREGROUND_RACE_POST` and rejects the capture.
 - Default output directory is `.runtime/screenshots/`, which is ignored by version control.
+
+**Success JSON (additive fields):**
+```json
+{
+  "success": true,
+  "output_path": "...",
+  "target_hwnd": 5770964,
+  "client_rect": {"left": 0, "top": 0, "right": 1536, "bottom": 960, "width": 1536, "height": 960},
+  "client_rect_virtual": {"left": 0, "top": 0, "right": 1536, "bottom": 960, "width": 1536, "height": 960},
+  "client_rect_physical": {"left": 0, "top": 0, "right": 1920, "bottom": 1200, "width": 1920, "height": 1200, "dpi": 120, "dpi_awareness_context": "PER_MONITOR_AWARE_V2", "virtual_screen": {"left": 0, "top": 0, "right": 1920, "bottom": 1200, "width": 1920, "height": 1200}},
+  "image_size": {"width": 1920, "height": 1200},
+  "dpi": 120,
+  "coordinate_space": "device",
+  "race_limitation_warning": "..."
+}
+```
+`client_rect`/`client_rect_virtual` remain the legacy *virtualized* rect (back-compat; it is what `click` coordinates address). `client_rect_physical`, `image_size`, `dpi`, and `coordinate_space="device"` describe the captured pixels. The capture is **not** guaranteed occlusion-free: a topmost window overlapping the client area would still be sampled; the race/occlusion limitation in §2 applies unchanged.
+
+**New error codes:** `PHYSICAL_RECT_UNAVAILABLE` (reliable physical measurement impossible), `CLIENT_RECT_OFFSCREEN` (physical client rect not fully on-screen), `CAPTURE_SIZE_MISMATCH` (returned image size != physical client size; no file written).
 
 ---
 
@@ -153,6 +178,7 @@ python Scripts/pgr_window_control.py click --x 768 --y 480
 
 **Contract & Safety Guards:**
 - Validates bounds: `0 <= x < client_width` and `0 <= y < client_height`. Rejects out-of-bounds coordinates with `OUT_OF_BOUNDS`.
+- Coordinates are in the **virtualized** client space (`client_rect`/`client_rect_virtual` from `status`/`screenshot`, e.g. `1536x960` at 125% scaling) — unchanged legacy semantics. `SendInput` absolute+virtualdesk normalization maps virtual screen points proportionally onto physical pixels, so legacy coordinates remain self-consistent even though `screenshot` captures in device pixels.
 - Verifies game window is in foreground before conversion.
 - Converts client-relative coordinates to absolute virtual screen coordinates.
 - Checks foreground immediately before `SendInput`.
@@ -186,4 +212,6 @@ Run the focused unit test suite:
 python -m unittest test_pgr_window_control.py
 ```
 
-The test suite uses `FakeWin32Driver` to simulate all Win32 GUI states, ownership trees, foreground races, boundary violations, control IDs, and auth results without interacting with any live desktop processes.
+The test suite uses `FakeWin32Driver` to simulate all Win32 GUI states, ownership trees, foreground races, boundary violations, DPI virtualization, control IDs, and auth results without interacting with any live desktop processes.
+
+**Deferred live verification (requires an unlocked console):** the physical-capture path is unit-tested only against `FakeWin32Driver`. Once the workstation is unlocked and the game window can hold foreground, run `python Scripts/pgr_window_control.py screenshot` against the live client and confirm the emitted `client_rect_physical`/`image_size` equal `1920x1200` (or the display's native resolution) and that the PNG shows the full frame rather than a top-left crop. Note that while the console is locked (`LockApp` foreground) the command correctly fails with `FOREGROUND_MISMATCH_PRE`.
