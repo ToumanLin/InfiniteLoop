@@ -205,6 +205,61 @@ python Scripts/pgr_window_control.py key --key space
 
 ---
 
+### 3.7 `action`
+Lists, inspects, or invokes **declarative named UI actions** defined in the tracked layout file `Scripts/pgr_ui_layout.json`. This is phase-1 accessibility groundwork: the Unity client exposes no Win32/UIA/MSAA control tree, so named actions are the CLI's semantic vocabulary over guarded pixel dispatch.
+
+```bash
+python Scripts/pgr_window_control.py action list [--include-provisional] [--layout PATH]
+python Scripts/pgr_window_control.py action show <name> [--layout PATH]
+python Scripts/pgr_window_control.py action invoke <name> [--allow-provisional] [--layout PATH]
+```
+
+**Layout file (`Scripts/pgr_ui_layout.json`, schema `pgr-ui-layout` v1):**
+Each action entry carries `description`, `clientControl` (client-side control provenance, e.g. the Lua name), `anchor`, `status`, `dispatch`, and `verification`; `calibrationSource` is required on `calibrated` entries. Anchors are `{"type": "normalized_point", "x", "y"}` with finite coordinates in `0 <= v < 1` — resolution-independent fractions of the client area. `invoke` resolves an anchor to **virtual** client pixels (`round(x*client_w)`, `round(y*client_h)` — the same virtualized coordinate space `click` uses) and delegates to the existing guarded `click` path.
+
+The loader is strict and fails closed: a missing file is `LAYOUT_NOT_FOUND`; wrong `schema`/`schemaVersion`, malformed JSON (including `NaN`/`Infinity` constants), unknown fields, missing required fields, non-`click` dispatch types, and out-of-range or non-finite coordinates are all `LAYOUT_INVALID` naming the offending field. `verification` objects follow a per-kind key allowlist: `kind: "none"` takes no extra keys, and `kind: "screenshot-diff"` may carry an optional finite numeric `minChangeRatio` in `(0, 1]`; unknown keys or malformed ratios are `LAYOUT_INVALID`.
+
+**Action status vocabulary:**
+- `calibrated` — the anchor was measured against a real client frame and the entry names its `calibrationSource` evidence. Dispatchable as-is.
+- `provisional` — the control is named (client Lua vocabulary) but its anchor is unmeasured. `action list` hides these unless `--include-provisional` is passed; `action invoke` refuses them with `ACTION_PROVISIONAL` unless `--allow-provisional` is passed explicitly, and always emits a warning when it does dispatch one. A provisional entry with `anchor: null` fails closed with `ACTION_ANCHOR_UNSET` even under `--allow-provisional` — no invented coordinates are ever dispatched.
+
+**`action invoke` flow:** load+validate layout → `ACTION_NOT_FOUND` if absent → `ACTION_PROVISIONAL` gate → `ACTION_ANCHOR_UNSET` gate → fresh `discover()` → resolve anchor → `ANCHOR_OUT_OF_BOUNDS` if the resolved pixel lands outside the *current* client rect → exactly **one** guarded `click` (all of §3.5's foreground checks apply unchanged). No retries, no multi-step sequences, ever.
+
+**Result JSON:**
+```json
+{
+  "success": true,
+  "command": "action invoke",
+  "action": "lobby.enter",
+  "action_status": "calibrated",
+  "anchor": {"space": "normalized", "x": 0.5, "y": 0.5},
+  "resolved_client": {"space": "virtual", "x": 768, "y": 480},
+  "dispatch": {"type": "click", "dispatched": true},
+  "verification": {"kind": "none", "performed": false, "result": "UNKNOWN", "message": "..."},
+  "warnings": [],
+  "foreground_retained": true,
+  "race_limitation_warning": "...",
+  "click": { "..." : "full inner click result" }
+}
+```
+
+**Honesty contract:** `verification.result` is always `UNKNOWN` in this slice — a dispatched `SendInput` does **not** prove the named UI control was hit or that the intended effect occurred. `dispatch.dispatched` only means the click reached `SendInput`; downstream guard failures (e.g. `FOREGROUND_MISMATCH_PRE`, `FOREGROUND_LOST_RACE`) propagate with `dispatched: false`. Declared verification kinds like `screenshot-diff` are accepted by the loader as policy but are **not executed** here.
+
+**New error codes:** `LAYOUT_NOT_FOUND`, `LAYOUT_INVALID`, `ACTION_NOT_FOUND`, `ACTION_PROVISIONAL`, `ACTION_ANCHOR_UNSET`, `ANCHOR_OUT_OF_BOUNDS`. Exit codes unchanged: `0` success, `1` guarded failure, `2` argparse usage errors.
+
+**`--layout PATH`:** overrides the default layout (intended for local calibration fixtures under ignored paths). The override is validated with exactly the same rules; there is no relaxed mode.
+
+**Route vocabulary & support matrix (as shipped):**
+
+| Status | Actions | Basis |
+|---|---|---|
+| `calibrated` | `lobby.enter` (0.5, 0.5); `lobby.dismiss_neutral_top` (0.5, 0.208); `lobby.dismiss_left_margin` (0.039, 0.5); `lobby.dismiss_top_left` (0.052, 0.083) | Observed working in the 2026-09-20 activation run (virtual 1536x960 normalized). The `dismiss_*` targets are neutral tap points; which element each dismissed is unverified. |
+| `provisional` (anchor unset) | `main_terminal.bottom_bar_toggle`, `main_terminal.camera_button` (`XUiMainTerminal:OnBtnScreenShotClick`), `photograph.btn_hide` (`XUiPhotographPanel.BtnHide` eye icon), `photograph.btn_scene` (`XUiPhotographPanel.BtnScene`), `photograph.scene_change_1..3` (`XUiPanelPhotographSceneChange.BtnSceneChange1/2/3`), `photograph.scene_list` (`XUiSceneSettingMain`), `scene_setting.open` (`OpenUiSceneSetting`) | Client Lua names are known; **no live coordinates have been calibrated**. The day/night/mode mapping of the numbered scene-change buttons is UNVERIFIED. |
+
+**Explicit limitation:** beyond the `lobby.*` entries above, no live controls are calibrated — every `main_terminal`/`photograph`/`scene_setting` anchor awaits an interactive calibration pass against the fixed full-frame `screenshot` on an unlocked workstation. Until then, invoking them is impossible (`ACTION_ANCHOR_UNSET`) rather than approximate. Nothing in this surface reads in-process UI state or confirms effects; `UNKNOWN` is never promoted to a success claim.
+
+---
+
 ## 4. Testing & Verification
 
 Run the focused unit test suite:

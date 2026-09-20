@@ -8,16 +8,19 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
 from Scripts.pgr_window_control import (
+    DEFAULT_UI_LAYOUT_PATH,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     DPI_AWARENESS_CONTEXT_UNAWARE,
     FakeWin32Driver,
     FakeWindow,
     PgrWindowController,
     build_parser,
+    load_ui_layout,
     main,
     ID_BTN_LOGIN,
     ID_BTN_SUBMIT,
@@ -614,6 +617,736 @@ class TestPgrWindowControl(unittest.TestCase):
         self.assertTrue(output["success"])
         if out_path.exists():
             out_path.unlink()
+
+
+class TestPgrUiActions(unittest.TestCase):
+    """Covers declarative named UI actions backed by pgr_ui_layout.json."""
+
+    @staticmethod
+    def _write_layout(directory: str, payload) -> str:
+        path = Path(directory) / "layout.json"
+        if isinstance(payload, str):
+            path.write_text(payload, encoding="utf-8")
+        else:
+            path.write_text(json.dumps(payload), encoding="utf-8")
+        return str(path)
+
+    @staticmethod
+    def _fixture_layout(actions: dict) -> dict:
+        return {
+            "schema": "pgr-ui-layout",
+            "schemaVersion": 1,
+            "actions": actions,
+        }
+
+    @staticmethod
+    def _calibrated_entry(x: float = 0.5, y: float = 0.25) -> dict:
+        return {
+            "description": "Calibrated fixture action",
+            "clientControl": "FixtureControl",
+            "anchor": {"type": "normalized_point", "x": x, "y": y},
+            "status": "calibrated",
+            "calibrationSource": "unit test fixture",
+            "dispatch": {"type": "click"},
+            "verification": {"kind": "none"},
+        }
+
+    @staticmethod
+    def _provisional_entry(anchor=None) -> dict:
+        return {
+            "description": "Provisional fixture action",
+            "clientControl": "FixtureControl",
+            "anchor": anchor,
+            "status": "provisional",
+            "dispatch": {"type": "click"},
+            "verification": {"kind": "none"},
+        }
+
+    @staticmethod
+    def _mouse_clicks(driver: FakeWin32Driver) -> list:
+        return [
+            a
+            for a in driver.recorded_actions
+            if a.get("action") == "mouse_click"
+        ]
+
+    def test_default_layout_file_is_valid_and_covers_route(self) -> None:
+        layout = load_ui_layout()  # tracked Scripts/pgr_ui_layout.json
+        self.assertEqual(layout["schema"], "pgr-ui-layout")
+        self.assertEqual(layout["schemaVersion"], 1)
+        actions = layout["actions"]
+
+        expected = {
+            "lobby.enter",
+            "lobby.dismiss_neutral_top",
+            "lobby.dismiss_left_margin",
+            "lobby.dismiss_top_left",
+            "main_terminal.bottom_bar_toggle",
+            "main_terminal.camera_button",
+            "photograph.btn_hide",
+            "photograph.btn_scene",
+            "photograph.scene_change_1",
+            "photograph.scene_change_2",
+            "photograph.scene_change_3",
+            "photograph.scene_list",
+            "scene_setting.open",
+        }
+        self.assertEqual(set(actions), expected)
+
+        enter = actions["lobby.enter"]
+        self.assertEqual(enter["status"], "calibrated")
+        self.assertEqual(
+            enter["anchor"],
+            {"type": "normalized_point", "x": 0.5, "y": 0.5},
+        )
+        self.assertTrue(enter["calibrationSource"])
+
+        for name in expected - {
+            "lobby.enter",
+            "lobby.dismiss_neutral_top",
+            "lobby.dismiss_left_margin",
+            "lobby.dismiss_top_left",
+        }:
+            self.assertEqual(actions[name]["status"], "provisional", name)
+            self.assertIsNone(actions[name]["anchor"], name)
+            self.assertTrue(actions[name]["clientControl"], name)
+
+    def test_action_list_default_lists_only_calibrated(self) -> None:
+        driver, controller = create_standard_test_environment()
+        res = controller.action_list()
+
+        self.assertTrue(res["success"])
+        self.assertEqual(res["command"], "action list")
+        self.assertEqual(res["schema_version"], 1)
+        self.assertFalse(res["include_provisional"])
+        listed_names = [a["name"] for a in res["actions"]]
+        self.assertIn("lobby.enter", listed_names)
+        self.assertNotIn("photograph.btn_hide", listed_names)
+        for entry in res["actions"]:
+            self.assertEqual(entry["status"], "calibrated")
+            self.assertTrue(entry["anchor_set"])
+        counts = res["counts"]
+        self.assertEqual(counts["listed"], counts["calibrated"])
+        self.assertEqual(
+            counts["total"], counts["calibrated"] + counts["provisional"]
+        )
+        self.assertGreater(counts["provisional"], 0)
+
+    def test_action_list_include_provisional(self) -> None:
+        driver, controller = create_standard_test_environment()
+        res = controller.action_list(include_provisional=True)
+
+        self.assertTrue(res["success"])
+        listed_names = [a["name"] for a in res["actions"]]
+        self.assertEqual(res["counts"]["listed"], res["counts"]["total"])
+        self.assertIn("photograph.btn_hide", listed_names)
+        self.assertIn("scene_setting.open", listed_names)
+        hide = next(
+            a for a in res["actions"] if a["name"] == "photograph.btn_hide"
+        )
+        self.assertEqual(hide["status"], "provisional")
+        self.assertFalse(hide["anchor_set"])
+
+    def test_action_show_entries_and_unknown(self) -> None:
+        driver, controller = create_standard_test_environment()
+
+        res = controller.action_show("lobby.enter")
+        self.assertTrue(res["success"])
+        self.assertEqual(res["action"], "lobby.enter")
+        self.assertEqual(res["entry"]["status"], "calibrated")
+        self.assertTrue(res["anchor_set"])
+        self.assertFalse(res["provisional_opt_in_required"])
+
+        res_prov = controller.action_show("photograph.btn_scene")
+        self.assertTrue(res_prov["success"])
+        self.assertTrue(res_prov["provisional_opt_in_required"])
+        self.assertFalse(res_prov["anchor_set"])
+        self.assertIn("BtnScene", res_prov["entry"]["clientControl"])
+
+        res_missing = controller.action_show("no.such.action")
+        self.assertFalse(res_missing["success"])
+        self.assertEqual(res_missing["error"], "ACTION_NOT_FOUND")
+        self.assertIn("lobby.enter", res_missing["available_actions"])
+
+    def test_action_invoke_calibrated_dispatches_exact_virtual_coords(self) -> None:
+        driver, controller = create_standard_test_environment()
+        driver.foreground_hwnd = 5770964
+
+        res = controller.action_invoke("lobby.enter")
+        self.assertTrue(res["success"])
+        self.assertEqual(res["action"], "lobby.enter")
+        self.assertEqual(res["action_status"], "calibrated")
+        self.assertEqual(
+            res["anchor"], {"space": "normalized", "x": 0.5, "y": 0.5}
+        )
+        # 0.5 * 1536 = 768, 0.5 * 960 = 480 in the virtualized client space.
+        self.assertEqual(
+            res["resolved_client"],
+            {"space": "virtual", "x": 768, "y": 480},
+        )
+        self.assertEqual(
+            res["dispatch"], {"type": "click", "dispatched": True}
+        )
+        self.assertEqual(res["verification"]["result"], "UNKNOWN")
+        self.assertFalse(res["verification"]["performed"])
+        self.assertTrue(res["foreground_retained"])
+        self.assertIn("race_limitation_warning", res)
+
+        clicks = self._mouse_clicks(driver)
+        self.assertEqual(len(clicks), 1)
+        # Fake client origin is (0,0): screen coords equal client coords.
+        self.assertEqual(clicks[0]["screen_x"], 768)
+        self.assertEqual(clicks[0]["screen_y"], 480)
+
+    def test_action_invoke_provisional_refused_without_opt_in(self) -> None:
+        driver, controller = create_standard_test_environment()
+        driver.foreground_hwnd = 5770964
+
+        res = controller.action_invoke("photograph.btn_hide")
+        self.assertFalse(res["success"])
+        self.assertEqual(res["error"], "ACTION_PROVISIONAL")
+        self.assertEqual(res["action_status"], "provisional")
+        self.assertEqual(self._mouse_clicks(driver), [])
+
+    def test_action_invoke_unset_anchor_fails_closed_even_with_opt_in(self) -> None:
+        driver, controller = create_standard_test_environment()
+        driver.foreground_hwnd = 5770964
+
+        res = controller.action_invoke(
+            "photograph.btn_hide", allow_provisional=True
+        )
+        self.assertFalse(res["success"])
+        self.assertEqual(res["error"], "ACTION_ANCHOR_UNSET")
+        self.assertEqual(self._mouse_clicks(driver), [])
+
+    def test_action_invoke_provisional_opt_in_dispatches(self) -> None:
+        driver, controller = create_standard_test_environment()
+        driver.foreground_hwnd = 5770964
+
+        layout = self._fixture_layout(
+            {
+                "fixture.tap": self._provisional_entry(
+                    anchor={"type": "normalized_point", "x": 0.25, "y": 0.5}
+                )
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_layout(tmp, layout)
+            res = controller.action_invoke(
+                "fixture.tap", allow_provisional=True, layout_path=path
+            )
+
+        self.assertTrue(res["success"])
+        self.assertEqual(res["action_status"], "provisional")
+        self.assertEqual(
+            res["resolved_client"],
+            {"space": "virtual", "x": 384, "y": 480},
+        )
+        self.assertTrue(res["dispatch"]["dispatched"])
+        self.assertEqual(res["verification"]["result"], "UNKNOWN")
+        self.assertTrue(
+            any("PROVISIONAL" in w for w in res["warnings"]),
+            res["warnings"],
+        )
+        clicks = self._mouse_clicks(driver)
+        self.assertEqual(len(clicks), 1)
+        self.assertEqual(clicks[0]["screen_x"], 384)
+        self.assertEqual(clicks[0]["screen_y"], 480)
+
+    def test_action_invoke_unknown_action(self) -> None:
+        driver, controller = create_standard_test_environment()
+        driver.foreground_hwnd = 5770964
+
+        res = controller.action_invoke("nonexistent.action")
+        self.assertFalse(res["success"])
+        self.assertEqual(res["error"], "ACTION_NOT_FOUND")
+        self.assertIn("lobby.enter", res["available_actions"])
+        self.assertEqual(self._mouse_clicks(driver), [])
+
+    def test_action_invoke_anchor_resolving_out_of_bounds(self) -> None:
+        driver, controller = create_standard_test_environment()
+        driver.foreground_hwnd = 5770964
+
+        # 0.99999 * 1536 rounds to 1536, which is >= the client width.
+        layout = self._fixture_layout(
+            {"edge.bounds": self._calibrated_entry(x=0.99999, y=0.5)}
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_layout(tmp, layout)
+            res = controller.action_invoke("edge.bounds", layout_path=path)
+
+        self.assertFalse(res["success"])
+        self.assertEqual(res["error"], "ANCHOR_OUT_OF_BOUNDS")
+        self.assertEqual(res["resolved_client"]["x"], 1536)
+        self.assertEqual(self._mouse_clicks(driver), [])
+
+    def test_action_layout_not_found(self) -> None:
+        driver, controller = create_standard_test_environment()
+        missing = str(Path(".runtime") / "definitely_missing_layout.json")
+
+        res_list = controller.action_list(layout_path=missing)
+        self.assertFalse(res_list["success"])
+        self.assertEqual(res_list["error"], "LAYOUT_NOT_FOUND")
+
+        res_invoke = controller.action_invoke(
+            "lobby.enter", layout_path=missing
+        )
+        self.assertFalse(res_invoke["success"])
+        self.assertEqual(res_invoke["error"], "LAYOUT_NOT_FOUND")
+
+    def test_action_layout_invalid_version(self) -> None:
+        driver, controller = create_standard_test_environment()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for label, mutate in (
+                ("unsupported_version", {"schemaVersion": 2}),
+                ("missing_version", {"schemaVersion": None}),
+                ("wrong_schema", {"schema": "other-schema"}),
+            ):
+                layout = self._fixture_layout(
+                    {"fixture.tap": self._calibrated_entry()}
+                )
+                for key, value in mutate.items():
+                    if value is None:
+                        layout.pop(key, None)
+                    else:
+                        layout[key] = value
+                path = self._write_layout(
+                    tmp, layout
+                )
+                res = controller.action_list(layout_path=path)
+                self.assertFalse(res["success"], label)
+                self.assertEqual(res["error"], "LAYOUT_INVALID", label)
+
+    def test_action_layout_rejects_nan_and_out_of_range(self) -> None:
+        driver, controller = create_standard_test_environment()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # Python's json accepts NaN by default; the loader must reject it.
+            nan_text = json.dumps(
+                self._fixture_layout(
+                    {"fixture.nan": self._calibrated_entry()}
+                )
+            ).replace('"x": 0.5', '"x": NaN')
+            self.assertIn("NaN", nan_text)
+            res = controller.action_list(
+                layout_path=self._write_layout(tmp, nan_text)
+            )
+            self.assertFalse(res["success"])
+            self.assertEqual(res["error"], "LAYOUT_INVALID")
+
+            for label, x, y in (
+                ("x_at_one", 1.0, 0.5),
+                ("x_above_one", 1.5, 0.5),
+                ("x_negative", -0.25, 0.5),
+                ("y_negative", 0.5, -0.1),
+            ):
+                layout = self._fixture_layout(
+                    {"edge.range": self._calibrated_entry(x=x, y=y)}
+                )
+                res = controller.action_list(
+                    layout_path=self._write_layout(tmp, layout)
+                )
+                self.assertFalse(res["success"], label)
+                self.assertEqual(res["error"], "LAYOUT_INVALID", label)
+
+    def test_action_layout_malformed(self) -> None:
+        driver, controller = create_standard_test_environment()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = {
+                "not_json": "{not valid json",
+                "top_level_array": "[]",
+                "missing_anchor": self._fixture_layout(
+                    {
+                        "bad.entry": {
+                            k: v
+                            for k, v in self._calibrated_entry().items()
+                            if k != "anchor"
+                        }
+                    }
+                ),
+                "unknown_field": self._fixture_layout(
+                    {
+                        "bad.entry": {
+                            **self._calibrated_entry(),
+                            "surprise": True,
+                        }
+                    }
+                ),
+                "string_coordinate": self._fixture_layout(
+                    {
+                        "bad.entry": {
+                            **self._calibrated_entry(),
+                            "anchor": {
+                                "type": "normalized_point",
+                                "x": "0.5",
+                                "y": 0.5,
+                            },
+                        }
+                    }
+                ),
+                "calibrated_without_source": self._fixture_layout(
+                    {
+                        "bad.entry": {
+                            k: v
+                            for k, v in self._calibrated_entry().items()
+                            if k != "calibrationSource"
+                        }
+                    }
+                ),
+                "calibrated_unset_anchor": self._fixture_layout(
+                    {
+                        "bad.entry": {
+                            **self._calibrated_entry(),
+                            "anchor": None,
+                        }
+                    }
+                ),
+                "unknown_status": self._fixture_layout(
+                    {
+                        "bad.entry": {
+                            **self._calibrated_entry(),
+                            "status": "verified",
+                        }
+                    }
+                ),
+            }
+            for label, payload in cases.items():
+                res = controller.action_list(
+                    layout_path=self._write_layout(tmp, payload)
+                )
+                self.assertFalse(res["success"], label)
+                self.assertEqual(res["error"], "LAYOUT_INVALID", label)
+
+    def test_action_invoke_propagates_click_guard_failure(self) -> None:
+        driver, controller = create_standard_test_environment()
+        driver.foreground_hwnd = 99999  # unrelated window holds foreground
+
+        res = controller.action_invoke("lobby.enter")
+        self.assertFalse(res["success"])
+        self.assertEqual(res["error"], "FOREGROUND_MISMATCH_PRE")
+        self.assertEqual(
+            res["dispatch"], {"type": "click", "dispatched": False}
+        )
+        self.assertEqual(res["verification"]["result"], "UNKNOWN")
+        self.assertEqual(self._mouse_clicks(driver), [])
+
+    def test_action_cli_wiring(self) -> None:
+        driver, _ = create_standard_test_environment()
+
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            code = main(["action", "list"], driver=driver)
+        self.assertEqual(code, 0)
+        output = json.loads(buf.getvalue())
+        self.assertTrue(output["success"])
+        self.assertEqual(output["command"], "action list")
+
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            code = main(
+                ["action", "list", "--include-provisional"], driver=driver
+            )
+        self.assertEqual(code, 0)
+        output = json.loads(buf.getvalue())
+        self.assertTrue(output["include_provisional"])
+        self.assertEqual(
+            output["counts"]["listed"], output["counts"]["total"]
+        )
+
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            code = main(["action", "show", "lobby.enter"], driver=driver)
+        self.assertEqual(code, 0)
+        output = json.loads(buf.getvalue())
+        self.assertEqual(output["entry"]["status"], "calibrated")
+
+        driver.foreground_hwnd = 5770964
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            code = main(
+                ["action", "invoke", "lobby.enter"], driver=driver
+            )
+        self.assertEqual(code, 0)
+        output = json.loads(buf.getvalue())
+        self.assertEqual(
+            output["resolved_client"],
+            {"space": "virtual", "x": 768, "y": 480},
+        )
+
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            code = main(
+                ["action", "invoke", "photograph.btn_hide"], driver=driver
+            )
+        self.assertEqual(code, 1)
+        output = json.loads(buf.getvalue())
+        self.assertEqual(output["error"], "ACTION_PROVISIONAL")
+
+        layout = self._fixture_layout(
+            {
+                "fixture.tap": self._provisional_entry(
+                    anchor={"type": "normalized_point", "x": 0.25, "y": 0.5}
+                )
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_layout(tmp, layout)
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                code = main(
+                    [
+                        "action",
+                        "invoke",
+                        "fixture.tap",
+                        "--allow-provisional",
+                        "--layout",
+                        path,
+                    ],
+                    driver=driver,
+                )
+        self.assertEqual(code, 0)
+        output = json.loads(buf.getvalue())
+        self.assertTrue(output["dispatch"]["dispatched"])
+
+        # Bare `action` (no subcommand) is an argparse usage error (exit 2).
+        with patch("sys.stderr", io.StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                main(["action"], driver=driver)
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_action_layout_rejects_unhashable_field_values(self) -> None:
+        """Unhashable JSON list/dict values must yield LAYOUT_INVALID.
+
+        Regression: frozenset membership tests hash the operand, so a
+        list/dict `status`, `anchor.type`, `dispatch.type`, or
+        `verification.kind` previously escaped as an uncaught TypeError
+        instead of the structured loader error.
+        """
+        driver, controller = create_standard_test_environment()
+        base = self._calibrated_entry()
+        cases = {
+            "status_list": {**base, "status": []},
+            "status_dict": {**base, "status": {}},
+            "anchor_type_list": {
+                **base,
+                "anchor": {"type": [], "x": 0.5, "y": 0.5},
+            },
+            "anchor_type_dict": {
+                **base,
+                "anchor": {"type": {}, "x": 0.5, "y": 0.5},
+            },
+            "dispatch_type_list": {**base, "dispatch": {"type": ["click"]}},
+            "dispatch_type_dict": {**base, "dispatch": {"type": {"t": 1}}},
+            "verification_kind_list": {
+                **base,
+                "verification": {"kind": []},
+            },
+            "verification_kind_dict": {
+                **base,
+                "verification": {"kind": {"k": 1}},
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            for label, entry in cases.items():
+                layout = self._fixture_layout({"bad.entry": entry})
+                path = self._write_layout(tmp, layout)
+                for command in ("list", "show", "invoke"):
+                    if command == "list":
+                        res = controller.action_list(layout_path=path)
+                    elif command == "show":
+                        res = controller.action_show(
+                            "bad.entry", layout_path=path
+                        )
+                    else:
+                        res = controller.action_invoke(
+                            "bad.entry", layout_path=path
+                        )
+                    self.assertFalse(res["success"], (label, command))
+                    self.assertEqual(
+                        res["error"], "LAYOUT_INVALID", (label, command)
+                    )
+        self.assertEqual(self._mouse_clicks(driver), [])
+
+    def test_action_layout_rejects_huge_integer_coordinate(self) -> None:
+        """Arbitrary-length JSON ints must not escape math.isfinite.
+
+        Regression: math.isfinite(10**400) raises OverflowError; the range
+        comparison must reject huge ints before any float conversion.
+        """
+        driver, controller = create_standard_test_environment()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            layout = self._fixture_layout(
+                {"edge.huge": self._calibrated_entry(x=10**400, y=0.5)}
+            )
+            res = controller.action_list(
+                layout_path=self._write_layout(tmp, layout)
+            )
+            self.assertFalse(res["success"])
+            self.assertEqual(res["error"], "LAYOUT_INVALID")
+
+            # Exponent overflow (1e999) parses to inf; same rejection path.
+            inf_text = json.dumps(
+                self._fixture_layout(
+                    {"edge.inf": self._calibrated_entry()}
+                )
+            ).replace('"x": 0.5', '"x": 1e999')
+            res = controller.action_list(
+                layout_path=self._write_layout(tmp, inf_text)
+            )
+            self.assertFalse(res["success"])
+            self.assertEqual(res["error"], "LAYOUT_INVALID")
+
+    def test_action_layout_verification_key_allowlist(self) -> None:
+        """Verification objects enforce a strict per-kind key allowlist."""
+        driver, controller = create_standard_test_environment()
+        base = self._calibrated_entry()
+
+        invalid = {
+            "none_extra_key": {"kind": "none", "bogus": 1},
+            "none_with_ratio": {"kind": "none", "minChangeRatio": 0.5},
+            "diff_extra_key": {"kind": "screenshot-diff", "bogus": 1},
+            "diff_ratio_string": {
+                "kind": "screenshot-diff",
+                "minChangeRatio": "big",
+            },
+            "diff_ratio_bool": {
+                "kind": "screenshot-diff",
+                "minChangeRatio": True,
+            },
+            "diff_ratio_zero": {"kind": "screenshot-diff", "minChangeRatio": 0},
+            "diff_ratio_negative": {
+                "kind": "screenshot-diff",
+                "minChangeRatio": -0.5,
+            },
+            "diff_ratio_above_one": {
+                "kind": "screenshot-diff",
+                "minChangeRatio": 1.5,
+            },
+            "diff_ratio_huge_int": {
+                "kind": "screenshot-diff",
+                "minChangeRatio": 10**400,
+            },
+        }
+        valid = {
+            "none_bare": {"kind": "none"},
+            "diff_bare": {"kind": "screenshot-diff"},
+            "diff_ratio_valid": {
+                "kind": "screenshot-diff",
+                "minChangeRatio": 0.01,
+            },
+            "diff_ratio_boundary": {
+                "kind": "screenshot-diff",
+                "minChangeRatio": 1,
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            for label, verification in invalid.items():
+                layout = self._fixture_layout(
+                    {"bad.entry": {**base, "verification": verification}}
+                )
+                res = controller.action_list(
+                    layout_path=self._write_layout(tmp, layout)
+                )
+                self.assertFalse(res["success"], label)
+                self.assertEqual(res["error"], "LAYOUT_INVALID", label)
+
+            for label, verification in valid.items():
+                layout = self._fixture_layout(
+                    {"ok.entry": {**base, "verification": verification}}
+                )
+                res = controller.action_list(
+                    layout_path=self._write_layout(tmp, layout)
+                )
+                self.assertTrue(res["success"], label)
+
+    def test_action_invoke_screenshot_diff_stays_declarative(self) -> None:
+        """A declared screenshot-diff verification is never executed here."""
+        driver, controller = create_standard_test_environment()
+        driver.foreground_hwnd = 5770964
+
+        entry = {
+            **self._calibrated_entry(),
+            "verification": {"kind": "screenshot-diff", "minChangeRatio": 0.01},
+        }
+        layout = self._fixture_layout({"fixture.tap": entry})
+        with tempfile.TemporaryDirectory() as tmp:
+            res = controller.action_invoke(
+                "fixture.tap", layout_path=self._write_layout(tmp, layout)
+            )
+
+        self.assertTrue(res["success"])
+        self.assertEqual(res["verification"]["kind"], "screenshot-diff")
+        self.assertFalse(res["verification"]["performed"])
+        self.assertEqual(res["verification"]["result"], "UNKNOWN")
+        grabs = [
+            a for a in driver.recorded_actions if a.get("action") == "grab_screen"
+        ]
+        self.assertEqual(grabs, [])
+
+    def test_action_invoke_uses_single_discovery_snapshot(self) -> None:
+        """Invoke resolves and dispatches on ONE discover() snapshot.
+
+        Regression: the anchor used to resolve against snapshot A while the
+        delegated click re-discovered snapshot B; a mid-invocation resize or
+        window change could produce a stale-offset or wrong-window dispatch.
+        """
+        driver, controller = create_standard_test_environment()
+        driver.foreground_hwnd = 5770964
+
+        discover_calls = []
+        real_discover = controller.discover
+
+        def counted_discover():
+            data = real_discover()
+            discover_calls.append(data)
+            if len(discover_calls) > 1:
+                # A second snapshot simulates a mid-invocation resize and a
+                # different target window: shrunken client rect, new hwnd.
+                stale_game = dict(data["windows"]["game"])
+                stale_game["hwnd"] = 424242
+                stale_game["client_rect"] = {
+                    "left": 0,
+                    "top": 0,
+                    "right": 768,
+                    "bottom": 480,
+                    "width": 768,
+                    "height": 480,
+                }
+                data["windows"]["game"] = stale_game
+            return data
+
+        controller.discover = counted_discover
+
+        res = controller.action_invoke("lobby.enter")
+        self.assertTrue(res["success"])
+        self.assertEqual(len(discover_calls), 1)
+        # Resolution and dispatch both used snapshot A: 0.5 * 1536 = 768,
+        # 0.5 * 960 = 480 against the original window.
+        self.assertEqual(
+            res["resolved_client"], {"space": "virtual", "x": 768, "y": 480}
+        )
+        self.assertEqual(res["target_hwnd"], 5770964)
+        clicks = self._mouse_clicks(driver)
+        self.assertEqual(len(clicks), 1)
+        self.assertEqual(clicks[0]["screen_x"], 768)
+        self.assertEqual(clicks[0]["screen_y"], 480)
+
+    def test_action_invoke_provisional_warning_never_claims_dispatch(self) -> None:
+        """The opt-in warning must not assert a dispatch that never ran."""
+        driver, controller = create_standard_test_environment()
+        driver.foreground_hwnd = 5770964
+
+        res = controller.action_invoke(
+            "photograph.btn_hide", allow_provisional=True
+        )
+        self.assertFalse(res["success"])
+        self.assertEqual(res["error"], "ACTION_ANCHOR_UNSET")
+        self.assertEqual(self._mouse_clicks(driver), [])
+        for warning in res["warnings"]:
+            self.assertNotIn("was dispatched", warning)
 
 
 if __name__ == "__main__":

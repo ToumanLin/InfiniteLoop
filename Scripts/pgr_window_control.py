@@ -19,6 +19,7 @@ import argparse
 import ctypes
 from ctypes import wintypes
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -1192,6 +1193,271 @@ class FakeWin32Driver(Win32Driver):
 
 
 # -----------------------------------------------------------------------------
+# UI Action Layout (declarative named actions)
+# -----------------------------------------------------------------------------
+# A versioned JSON file maps authored action names to normalized client
+# anchors plus provenance. Anchors resolve into the same virtualized client
+# coordinate space that `click` consumes, so calibrated legacy coordinates
+# carry over directly (e.g. 768/1536 = 0.5).
+UI_LAYOUT_SCHEMA = "pgr-ui-layout"
+UI_LAYOUT_SCHEMA_VERSION = 1
+DEFAULT_UI_LAYOUT_PATH = Path(__file__).resolve().with_name("pgr_ui_layout.json")
+
+_LAYOUT_TOP_LEVEL_FIELDS = frozenset(("schema", "schemaVersion", "actions"))
+_ACTION_REQUIRED_FIELDS = frozenset(
+    ("description", "clientControl", "anchor", "status", "dispatch", "verification")
+)
+_ACTION_ALLOWED_FIELDS = _ACTION_REQUIRED_FIELDS | frozenset(
+    ("calibrationSource",)
+)
+_ACTION_STATUSES = frozenset(("calibrated", "provisional"))
+_ANCHOR_TYPES = frozenset(("normalized_point",))
+_ANCHOR_FIELDS = frozenset(("type", "x", "y"))
+_DISPATCH_TYPES = frozenset(("click",))
+_VERIFICATION_KINDS = frozenset(("none", "screenshot-diff"))
+_VERIFICATION_ALLOWED_FIELDS = {
+    "none": frozenset(("kind",)),
+    "screenshot-diff": frozenset(("kind", "minChangeRatio")),
+}
+
+
+class UiLayoutError(Exception):
+    """Structured UI layout load/validation failure.
+
+    Carries a machine-readable code (LAYOUT_NOT_FOUND or LAYOUT_INVALID) so
+    callers fail closed with a distinct CLI error payload.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _is_json_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _validate_action_entry(name: str, entry: Any, source: str) -> None:
+    """Validates a single layout action entry; raises UiLayoutError on any defect."""
+    prefix = f"UI layout {source} action '{name}'"
+    if not isinstance(entry, dict):
+        raise UiLayoutError(
+            "LAYOUT_INVALID", f"{prefix} must be a JSON object."
+        )
+    unknown = set(entry) - _ACTION_ALLOWED_FIELDS
+    if unknown:
+        raise UiLayoutError(
+            "LAYOUT_INVALID",
+            f"{prefix} has unsupported field(s): {sorted(unknown)}.",
+        )
+    missing = _ACTION_REQUIRED_FIELDS - set(entry)
+    if missing:
+        raise UiLayoutError(
+            "LAYOUT_INVALID",
+            f"{prefix} is missing required field(s): {sorted(missing)}.",
+        )
+
+    for field in ("description", "clientControl"):
+        value = entry[field]
+        if not isinstance(value, str) or not value.strip():
+            raise UiLayoutError(
+                "LAYOUT_INVALID",
+                f"{prefix} field '{field}' must be a non-empty string.",
+            )
+
+    status = entry["status"]
+    if not isinstance(status, str) or status not in _ACTION_STATUSES:
+        raise UiLayoutError(
+            "LAYOUT_INVALID",
+            f"{prefix} field 'status' must be one of "
+            f"{sorted(_ACTION_STATUSES)}; got {status!r}.",
+        )
+
+    calibration_source = entry.get("calibrationSource")
+    if calibration_source is not None and (
+        not isinstance(calibration_source, str)
+        or not calibration_source.strip()
+    ):
+        raise UiLayoutError(
+            "LAYOUT_INVALID",
+            f"{prefix} field 'calibrationSource' must be a non-empty string "
+            "when present.",
+        )
+    if status == "calibrated" and not calibration_source:
+        raise UiLayoutError(
+            "LAYOUT_INVALID",
+            f"{prefix} is 'calibrated' but lacks the required "
+            "'calibrationSource' provenance.",
+        )
+
+    anchor = entry["anchor"]
+    if anchor is None:
+        # An unset anchor is only meaningful for provisional entries; a
+        # calibrated entry without measured coordinates is contradictory and
+        # must fail closed.
+        if status == "calibrated":
+            raise UiLayoutError(
+                "LAYOUT_INVALID",
+                f"{prefix} is 'calibrated' but its anchor is unset.",
+            )
+    elif isinstance(anchor, dict):
+        if set(anchor) != _ANCHOR_FIELDS:
+            raise UiLayoutError(
+                "LAYOUT_INVALID",
+                f"{prefix} anchor must have exactly the fields "
+                f"{sorted(_ANCHOR_FIELDS)}.",
+            )
+        anchor_type = anchor["type"]
+        if not isinstance(anchor_type, str) or anchor_type not in _ANCHOR_TYPES:
+            raise UiLayoutError(
+                "LAYOUT_INVALID",
+                f"{prefix} anchor 'type' must be one of "
+                f"{sorted(_ANCHOR_TYPES)}; got {anchor_type!r}.",
+            )
+        for axis in ("x", "y"):
+            value = anchor[axis]
+            if (
+                not _is_json_number(value)
+                or not (0.0 <= value < 1.0)
+                or not math.isfinite(value)
+            ):
+                raise UiLayoutError(
+                    "LAYOUT_INVALID",
+                    f"{prefix} anchor '{axis}' must be a finite number with "
+                    f"0 <= {axis} < 1; got {value!r}.",
+                )
+    else:
+        raise UiLayoutError(
+            "LAYOUT_INVALID",
+            f"{prefix} field 'anchor' must be null or a normalized-point "
+            "object.",
+        )
+
+    dispatch = entry["dispatch"]
+    if (
+        not isinstance(dispatch, dict)
+        or set(dispatch) != {"type"}
+        or not isinstance(dispatch["type"], str)
+        or dispatch["type"] not in _DISPATCH_TYPES
+    ):
+        raise UiLayoutError(
+            "LAYOUT_INVALID",
+            f"{prefix} field 'dispatch' must be an object whose only key is "
+            f"'type' with a value in {sorted(_DISPATCH_TYPES)}.",
+        )
+
+    verification = entry["verification"]
+    kind = verification.get("kind") if isinstance(verification, dict) else None
+    if not isinstance(kind, str) or kind not in _VERIFICATION_KINDS:
+        raise UiLayoutError(
+            "LAYOUT_INVALID",
+            f"{prefix} field 'verification' must be an object with 'kind' in "
+            f"{sorted(_VERIFICATION_KINDS)}.",
+        )
+    unsupported_verification_fields = (
+        set(verification) - _VERIFICATION_ALLOWED_FIELDS[kind]
+    )
+    if unsupported_verification_fields:
+        raise UiLayoutError(
+            "LAYOUT_INVALID",
+            f"{prefix} verification kind '{kind}' does not support "
+            f"field(s): {sorted(unsupported_verification_fields)}.",
+        )
+    if "minChangeRatio" in verification:
+        ratio = verification["minChangeRatio"]
+        if (
+            not _is_json_number(ratio)
+            or not (0.0 < ratio <= 1.0)
+            or not math.isfinite(ratio)
+        ):
+            raise UiLayoutError(
+                "LAYOUT_INVALID",
+                f"{prefix} verification 'minChangeRatio' must be a finite "
+                f"number with 0 < minChangeRatio <= 1; got {ratio!r}.",
+            )
+
+
+def load_ui_layout(layout_path: Optional[str] = None) -> Dict[str, Any]:
+    """Loads and strictly validates a declarative UI action layout file.
+
+    Structural defects, unsupported versions, malformed actions, non-finite
+    or out-of-range normalized coordinates, and unknown fields all fail
+    closed by raising UiLayoutError. A missing file raises LAYOUT_NOT_FOUND;
+    everything else raises LAYOUT_INVALID naming the offending field.
+    """
+    path = (
+        Path(layout_path).expanduser()
+        if layout_path
+        else DEFAULT_UI_LAYOUT_PATH
+    )
+    if not path.is_file():
+        raise UiLayoutError(
+            "LAYOUT_NOT_FOUND", f"UI layout file not found: {path}"
+        )
+
+    def _reject_constant(token: str) -> None:
+        raise UiLayoutError(
+            "LAYOUT_INVALID",
+            f"UI layout {path} contains the non-JSON constant '{token}'.",
+        )
+
+    try:
+        raw = json.loads(
+            path.read_text(encoding="utf-8"), parse_constant=_reject_constant
+        )
+    except UiLayoutError:
+        raise
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+        raise UiLayoutError(
+            "LAYOUT_INVALID", f"UI layout {path} could not be parsed: {e}"
+        )
+
+    if not isinstance(raw, dict):
+        raise UiLayoutError(
+            "LAYOUT_INVALID", f"UI layout {path} must be a JSON object."
+        )
+    unknown_top = set(raw) - _LAYOUT_TOP_LEVEL_FIELDS
+    if unknown_top:
+        raise UiLayoutError(
+            "LAYOUT_INVALID",
+            f"UI layout {path} has unsupported top-level field(s): "
+            f"{sorted(unknown_top)}.",
+        )
+    if raw.get("schema") != UI_LAYOUT_SCHEMA:
+        raise UiLayoutError(
+            "LAYOUT_INVALID",
+            f"UI layout {path} field 'schema' must be "
+            f"'{UI_LAYOUT_SCHEMA}'.",
+        )
+    version = raw.get("schemaVersion")
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version != UI_LAYOUT_SCHEMA_VERSION
+    ):
+        raise UiLayoutError(
+            "LAYOUT_INVALID",
+            f"UI layout {path} has unsupported schemaVersion {version!r}; "
+            f"expected {UI_LAYOUT_SCHEMA_VERSION}.",
+        )
+    actions = raw.get("actions")
+    if not isinstance(actions, dict):
+        raise UiLayoutError(
+            "LAYOUT_INVALID",
+            f"UI layout {path} field 'actions' must be a JSON object.",
+        )
+    for action_name, action_entry in actions.items():
+        if not isinstance(action_name, str) or not action_name.strip():
+            raise UiLayoutError(
+                "LAYOUT_INVALID",
+                f"UI layout {path} contains an action with an empty name.",
+            )
+        _validate_action_entry(action_name, action_entry, str(path))
+    return raw
+
+
+# -----------------------------------------------------------------------------
 # Controller Business Logic
 # -----------------------------------------------------------------------------
 class PgrWindowController:
@@ -1973,7 +2239,18 @@ class PgrWindowController:
 
         Verifies game foreground before and after input. No implicit retry.
         """
-        data = self.discover()
+        return self._guarded_click(self.discover(), x, y)
+
+    def _guarded_click(
+        self, data: Dict[str, Any], x: int, y: int
+    ) -> Dict[str, Any]:
+        """Runs the guarded click flow against a single discovery snapshot.
+
+        `click` passes a fresh `discover()` result; `action_invoke` passes
+        the same snapshot it resolved and bounds-checked its anchor against,
+        avoiding a stale offset caused by a second discovery. As with direct
+        clicks, an OS window change after discovery remains a race limitation.
+        """
         if not data["process"]["found"]:
             return {
                 "success": False,
@@ -2128,6 +2405,295 @@ class PgrWindowController:
             ),
         }
 
+    @staticmethod
+    def _layout_path_label(layout_path: Optional[str]) -> str:
+        if layout_path:
+            return str(Path(layout_path).expanduser())
+        return str(DEFAULT_UI_LAYOUT_PATH)
+
+    def action_list(
+        self,
+        include_provisional: bool = False,
+        layout_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Lists declarative UI actions from the layout file.
+
+        Read-only: never enumerates or touches the game window. Provisional
+        (uncalibrated) entries are hidden unless include_provisional is set.
+        """
+        try:
+            layout = load_ui_layout(layout_path)
+        except UiLayoutError as e:
+            return {
+                "success": False,
+                "command": "action list",
+                "error": e.code,
+                "message": e.message,
+            }
+
+        actions = layout["actions"]
+        listed = []
+        for name in sorted(actions):
+            entry = actions[name]
+            if entry["status"] == "provisional" and not include_provisional:
+                continue
+            listed.append(
+                {
+                    "name": name,
+                    "status": entry["status"],
+                    "description": entry["description"],
+                    "clientControl": entry["clientControl"],
+                    "anchor": entry["anchor"],
+                    "anchor_set": entry["anchor"] is not None,
+                }
+            )
+
+        return {
+            "success": True,
+            "command": "action list",
+            "layout_path": self._layout_path_label(layout_path),
+            "schema": layout["schema"],
+            "schema_version": layout["schemaVersion"],
+            "include_provisional": include_provisional,
+            "actions": listed,
+            "counts": {
+                "listed": len(listed),
+                "total": len(actions),
+                "calibrated": sum(
+                    1 for e in actions.values() if e["status"] == "calibrated"
+                ),
+                "provisional": sum(
+                    1 for e in actions.values() if e["status"] == "provisional"
+                ),
+            },
+        }
+
+    def action_show(
+        self, name: str, layout_path: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Shows one layout action entry verbatim. Read-only."""
+        try:
+            layout = load_ui_layout(layout_path)
+        except UiLayoutError as e:
+            return {
+                "success": False,
+                "command": "action show",
+                "action": name,
+                "error": e.code,
+                "message": e.message,
+            }
+
+        entry = layout["actions"].get(name)
+        if entry is None:
+            return {
+                "success": False,
+                "command": "action show",
+                "action": name,
+                "error": "ACTION_NOT_FOUND",
+                "message": f"Action '{name}' is not defined in the layout.",
+                "available_actions": sorted(layout["actions"]),
+            }
+
+        return {
+            "success": True,
+            "command": "action show",
+            "action": name,
+            "layout_path": self._layout_path_label(layout_path),
+            "entry": dict(entry),
+            "anchor_set": entry["anchor"] is not None,
+            "provisional_opt_in_required": entry["status"] == "provisional",
+        }
+
+    def action_invoke(
+        self,
+        name: str,
+        allow_provisional: bool = False,
+        layout_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Resolves a named layout anchor and dispatches one guarded click.
+
+        Exactly one click is dispatched per invocation; there is no retry and
+        no sequencing. A successful dispatch only proves SendInput accepted
+        the event against a verified-foreground window — the named UI effect
+        is always reported as verification UNKNOWN.
+        """
+        try:
+            layout = load_ui_layout(layout_path)
+        except UiLayoutError as e:
+            return {
+                "success": False,
+                "command": "action invoke",
+                "action": name,
+                "error": e.code,
+                "message": e.message,
+            }
+
+        entry = layout["actions"].get(name)
+        if entry is None:
+            return {
+                "success": False,
+                "command": "action invoke",
+                "action": name,
+                "error": "ACTION_NOT_FOUND",
+                "message": f"Action '{name}' is not defined in the layout.",
+                "available_actions": sorted(layout["actions"]),
+            }
+
+        warnings: List[str] = []
+        if entry["status"] == "provisional":
+            if not allow_provisional:
+                return {
+                    "success": False,
+                    "command": "action invoke",
+                    "action": name,
+                    "action_status": "provisional",
+                    "error": "ACTION_PROVISIONAL",
+                    "message": (
+                        f"Action '{name}' is provisional (uncalibrated). "
+                        "Dispatch is refused unless --allow-provisional is "
+                        "passed explicitly."
+                    ),
+                }
+            warnings.append(
+                f"Action '{name}' is PROVISIONAL: its anchor is uncalibrated "
+                "and dispatch is permitted only because --allow-provisional "
+                "was passed. The click may not hit the intended UI control."
+            )
+
+        anchor = entry["anchor"]
+        if anchor is None:
+            return {
+                "success": False,
+                "command": "action invoke",
+                "action": name,
+                "action_status": entry["status"],
+                "anchor": None,
+                "error": "ACTION_ANCHOR_UNSET",
+                "message": (
+                    f"Action '{name}' has no anchor coordinates; nothing was "
+                    "dispatched. A calibration pass must measure the anchor "
+                    "first."
+                ),
+                "warnings": warnings,
+            }
+
+        data = self.discover()
+        if not data["process"]["found"]:
+            return {
+                "success": False,
+                "command": "action invoke",
+                "action": name,
+                "action_status": entry["status"],
+                "error": "PROCESS_NOT_FOUND",
+                "message": "PGR.exe process was not found.",
+                "warnings": warnings,
+            }
+
+        game_win = data["windows"]["game"]
+        if not game_win:
+            return {
+                "success": False,
+                "command": "action invoke",
+                "action": name,
+                "action_status": entry["status"],
+                "error": "GAME_WINDOW_NOT_FOUND",
+                "message": "UnityWndClass game window was not found.",
+                "warnings": warnings,
+            }
+
+        c_rect = game_win["client_rect"]
+        c_w = c_rect["width"]
+        c_h = c_rect["height"]
+        if c_w <= 0 or c_h <= 0:
+            return {
+                "success": False,
+                "command": "action invoke",
+                "action": name,
+                "action_status": entry["status"],
+                "error": "INVALID_CLIENT_DIMENSIONS",
+                "message": (
+                    f"Game window client dimensions are non-positive: "
+                    f"{c_w}x{c_h}; the anchor cannot be resolved."
+                ),
+                "warnings": warnings,
+            }
+
+        # Normalized anchors resolve against the same virtualized client rect
+        # that `click` consumes (round(x*client_w), round(y*client_h)).
+        resolved_x = int(round(anchor["x"] * c_w))
+        resolved_y = int(round(anchor["y"] * c_h))
+        resolved_client = {
+            "space": "virtual",
+            "x": resolved_x,
+            "y": resolved_y,
+        }
+        normalized_anchor = {
+            "space": "normalized",
+            "x": anchor["x"],
+            "y": anchor["y"],
+        }
+
+        if not (0 <= resolved_x < c_w and 0 <= resolved_y < c_h):
+            return {
+                "success": False,
+                "command": "action invoke",
+                "action": name,
+                "action_status": entry["status"],
+                "anchor": normalized_anchor,
+                "resolved_client": resolved_client,
+                "error": "ANCHOR_OUT_OF_BOUNDS",
+                "message": (
+                    f"Action '{name}' anchor ({anchor['x']}, {anchor['y']}) "
+                    f"resolves to ({resolved_x}, {resolved_y}), outside the "
+                    f"current client bounds (0, 0, {c_w}, {c_h}). Nothing "
+                    "was dispatched."
+                ),
+                "client_width": c_w,
+                "client_height": c_h,
+                "warnings": warnings,
+            }
+
+        # Dispatch on the SAME discovery snapshot used to resolve and
+        # bounds-check the anchor above.
+        click_result = self._guarded_click(data, resolved_x, resolved_y)
+        # The guarded click only reaches the coordinate-reporting payload
+        # after SendInput was attempted; pre-dispatch guard failures return
+        # early without it.
+        dispatched = "screen_coords" in click_result
+
+        result: Dict[str, Any] = {
+            "success": bool(click_result.get("success")),
+            "command": "action invoke",
+            "action": name,
+            "action_status": entry["status"],
+            "anchor": normalized_anchor,
+            "resolved_client": resolved_client,
+            "dispatch": {"type": "click", "dispatched": dispatched},
+            "verification": {
+                "kind": entry["verification"]["kind"],
+                "performed": False,
+                "result": "UNKNOWN",
+                "message": (
+                    "No verification was performed; a dispatched click does "
+                    "not prove the named UI effect occurred."
+                ),
+            },
+            "warnings": warnings,
+            "click": click_result,
+        }
+        if click_result.get("error"):
+            result["error"] = click_result["error"]
+            result["message"] = click_result.get("message")
+        for key in (
+            "foreground_retained",
+            "foreground_after",
+            "target_hwnd",
+            "race_limitation_warning",
+        ):
+            if key in click_result:
+                result[key] = click_result[key]
+        return result
+
 
 # -----------------------------------------------------------------------------
 # CLI Parser & Entry Point
@@ -2212,6 +2778,60 @@ def build_parser() -> argparse.ArgumentParser:
         help="Key name (e.g. space, enter, escape)",
     )
 
+    # action (declarative named UI actions from the layout file)
+    action_parser = subparsers.add_parser(
+        "action",
+        help="List, inspect, or invoke named UI actions from the layout file",
+    )
+    action_subparsers = action_parser.add_subparsers(
+        dest="action_command", required=True
+    )
+
+    action_list_parser = action_subparsers.add_parser(
+        "list",
+        help="List layout actions (calibrated only unless --include-provisional)",
+    )
+    action_list_parser.add_argument(
+        "--include-provisional",
+        action="store_true",
+        help="Also list provisional (uncalibrated) actions",
+    )
+    action_list_parser.add_argument(
+        "--layout",
+        default=None,
+        help="Override layout file path (validated with the same rules)",
+    )
+
+    action_show_parser = action_subparsers.add_parser(
+        "show", help="Show one layout action entry"
+    )
+    action_show_parser.add_argument(
+        "name", help="Action name (e.g. lobby.enter)"
+    )
+    action_show_parser.add_argument(
+        "--layout",
+        default=None,
+        help="Override layout file path (validated with the same rules)",
+    )
+
+    action_invoke_parser = action_subparsers.add_parser(
+        "invoke",
+        help="Resolve a named anchor and dispatch exactly one guarded click",
+    )
+    action_invoke_parser.add_argument(
+        "name", help="Action name (e.g. lobby.enter)"
+    )
+    action_invoke_parser.add_argument(
+        "--allow-provisional",
+        action="store_true",
+        help="Allow dispatch of provisional (uncalibrated) actions",
+    )
+    action_invoke_parser.add_argument(
+        "--layout",
+        default=None,
+        help="Override layout file path (validated with the same rules)",
+    )
+
     return parser
 
 
@@ -2236,6 +2856,29 @@ def main(argv: Optional[List[str]] = None, driver: Optional[Win32Driver] = None)
         result = controller.click(x=args.x, y=args.y)
     elif args.command == "key":
         result = controller.key(key_name=args.key)
+    elif args.command == "action":
+        if args.action_command == "list":
+            result = controller.action_list(
+                include_provisional=args.include_provisional,
+                layout_path=args.layout,
+            )
+        elif args.action_command == "show":
+            result = controller.action_show(
+                name=args.name,
+                layout_path=args.layout,
+            )
+        elif args.action_command == "invoke":
+            result = controller.action_invoke(
+                name=args.name,
+                allow_provisional=args.allow_provisional,
+                layout_path=args.layout,
+            )
+        else:
+            result = {
+                "success": False,
+                "error": "UNKNOWN_COMMAND",
+                "message": f"Unknown action subcommand: {args.action_command}",
+            }
     else:
         result = {
             "success": False,

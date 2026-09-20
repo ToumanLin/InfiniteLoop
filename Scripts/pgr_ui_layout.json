@@ -1,0 +1,114 @@
+{
+  "schema": "pgr-ui-layout",
+  "schemaVersion": 1,
+  "actions": {
+    "lobby.enter": {
+      "description": "Title screen tap-to-enter.",
+      "clientControl": "title screen (pointer anywhere)",
+      "anchor": {"type": "normalized_point", "x": 0.5, "y": 0.5},
+      "status": "calibrated",
+      "calibrationSource": "observed activation run 2026-09-20, raw/05-post-title.png (virtual client 1536x960 -> 768,480)",
+      "dispatch": {"type": "click"},
+      "verification": {"kind": "none"}
+    },
+    "lobby.dismiss_neutral_top": {
+      "description": "Neutral tap on the upper lobby area observed to dismiss overlays during the activation run; the exact dismissed element is unverified.",
+      "clientControl": "lobby overlay dismissal (client control unverified)",
+      "anchor": {"type": "normalized_point", "x": 0.5, "y": 0.208},
+      "status": "calibrated",
+      "calibrationSource": "observed working in activation run 2026-09-20 (virtual client 1536x960 -> ~768,200)",
+      "dispatch": {"type": "click"},
+      "verification": {"kind": "none"}
+    },
+    "lobby.dismiss_left_margin": {
+      "description": "Neutral tap on the left lobby margin observed to dismiss overlays during the activation run; the exact dismissed element is unverified.",
+      "clientControl": "lobby overlay dismissal (client control unverified)",
+      "anchor": {"type": "normalized_point", "x": 0.039, "y": 0.5},
+      "status": "calibrated",
+      "calibrationSource": "observed working in activation run 2026-09-20 (virtual client 1536x960 -> ~60,480)",
+      "dispatch": {"type": "click"},
+      "verification": {"kind": "none"}
+    },
+    "lobby.dismiss_top_left": {
+      "description": "Neutral tap on the top-left lobby area observed to dismiss overlays during the activation run; the exact dismissed element is unverified.",
+      "clientControl": "lobby overlay dismissal (client control unverified)",
+      "anchor": {"type": "normalized_point", "x": 0.052, "y": 0.083},
+      "status": "calibrated",
+      "calibrationSource": "observed working in activation run 2026-09-20 (virtual client 1536x960 -> ~80,80)",
+      "dispatch": {"type": "click"},
+      "verification": {"kind": "none"}
+    },
+    "main_terminal.bottom_bar_toggle": {
+      "description": "Main terminal right-panel bottom bar toggle; route step toward the camera button.",
+      "clientControl": "XUiMainTerminal right-panel bottom bar",
+      "anchor": null,
+      "status": "provisional",
+      "dispatch": {"type": "click"},
+      "verification": {"kind": "none"}
+    },
+    "main_terminal.camera_button": {
+      "description": "Main terminal right-panel bottom bar camera button; opens the photograph UI.",
+      "clientControl": "XUiMainTerminal:OnBtnScreenShotClick -> XLuaUiManager.Open(\"UiPhotograph\")",
+      "anchor": null,
+      "status": "provisional",
+      "dispatch": {"type": "click"},
+      "verification": {"kind": "none"}
+    },
+    "photograph.btn_hide": {
+      "description": "Photograph panel eye icon; hides all other UI.",
+      "clientControl": "XUiPhotographPanel.BtnHide -> OnBtnHideClick/UpdateViewState",
+      "anchor": null,
+      "status": "provisional",
+      "dispatch": {"type": "click"},
+      "verification": {"kind": "none"}
+    },
+    "photograph.btn_scene": {
+      "description": "Photograph panel scene icon; opens the scene-change panel.",
+      "clientControl": "XUiPhotographPanel.BtnScene -> XUiPanelPhotographSceneChange",
+      "anchor": null,
+      "status": "provisional",
+      "dispatch": {"type": "click"},
+      "verification": {"kind": "none"}
+    },
+    "photograph.scene_change_1": {
+      "description": "Scene-change button 1. Which scene mode (day/night/other) it selects is UNVERIFIED.",
+      "clientControl": "XUiPanelPhotographSceneChange.BtnSceneChange1",
+      "anchor": null,
+      "status": "provisional",
+      "dispatch": {"type": "click"},
+      "verification": {"kind": "none"}
+    },
+    "photograph.scene_change_2": {
+      "description": "Scene-change button 2. Which scene mode (day/night/other) it selects is UNVERIFIED.",
+      "clientControl": "XUiPanelPhotographSceneChange.BtnSceneChange2",
+      "anchor": null,
+      "status": "provisional",
+      "dispatch": {"type": "click"},
+      "verification": {"kind": "none"}
+    },
+    "photograph.scene_change_3": {
+      "description": "Scene-change button 3. Which scene mode (day/night/other) it selects is UNVERIFIED.",
+      "clientControl": "XUiPanelPhotographSceneChange.BtnSceneChange3",
+      "anchor": null,
+      "status": "provisional",
+      "dispatch": {"type": "click"},
+      "verification": {"kind": "none"}
+    },
+    "photograph.scene_list": {
+      "description": "Scene-setting scrollable list region.",
+      "clientControl": "XUiSceneSettingMain (GetSceneIdList/SortSceneIdList/ChangeDisplay)",
+      "anchor": null,
+      "status": "provisional",
+      "dispatch": {"type": "click"},
+      "verification": {"kind": "none"}
+    },
+    "scene_setting.open": {
+      "description": "Opens the scene-setting list UI from the main terminal.",
+      "clientControl": "XUiMainTerminal -> XDataCenter.PhotographManager.OpenUiSceneSetting()",
+      "anchor": null,
+      "status": "provisional",
+      "dispatch": {"type": "click"},
+      "verification": {"kind": "none"}
+    }
+  }
+}
