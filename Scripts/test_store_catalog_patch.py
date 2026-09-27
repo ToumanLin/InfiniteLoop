@@ -110,6 +110,8 @@ class PatchTests(unittest.TestCase):
                 lua.execute('''
                     XClass = function() return {} end
                     CS = {XTextManager={GetText=function(key) return key end}}
+                    TextManager = CS.XTextManager
+                    XPurchaseConfigs = {UiType={CoatingLB="coating"}}
                     XUiHelper = {GetTime=function(t) return tostring(t) end, TimeFormatType={PURCHASELB=1}}
                     XOverseaManager = {IsKRRegion=function() return false end}
                     function Active(value)
@@ -122,6 +124,7 @@ class PatchTests(unittest.TestCase):
                 ''')
                 lua.globals().CardClass = lua.execute(patch_catalog_lua(name, (source_dir / name).read_text(encoding='utf-8')))
                 lua.execute('''
+                    setmetatable(Card, {__index=CardClass})
                     CardClass.UpdateTimer(Card, false, 1)
                     assert(Card.ImgHave.gameObject.active and not Card.ImgSellout.gameObject.active)
                     CardClass.UpdateTimer(Card, false, 1)
