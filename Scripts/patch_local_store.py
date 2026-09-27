@@ -52,7 +52,17 @@ def patch_catalog_lua(name, script):
         if script.count(anchor) != 1:
             raise RuntimeError(f'{name}: purchase icon call changed')
         script = script.replace(anchor, f'XPurchaseConfigs.GetIconPathByIconName({owner}.Icon, {owner})')
-        if name in ('XUiPurchaseLBListItem.lua', 'XUiPurchaseCoatingLBListItem.lua'):
+        helper = 'function XUiPurchaseCoatingLBListItem:SetImgSelloutVisible(isShow)'
+        if name == 'XUiPurchaseCoatingLBListItem.lua' and helper in script:
+            # 4.8 routes every sold-out transition through one helper.
+            anchor = (helper + '\n    if self.ItemData and self.ItemData.UiType == XPurchaseConfigs.UiType.CoatingLB then\n'
+                      '        self:SetImgHaveVisible(isShow)\n        return\n    end\n'
+                      '    self.ImgSellout.gameObject:SetActive(isShow)').replace('\n', newline)
+            if script.count(anchor) != 1:
+                raise RuntimeError(f'{name}: sold-out helper changed')
+            script = script.replace(anchor, anchor + newline
+                + '    if isShow and self.ImgHave then self.ImgHave.gameObject:SetActive(false) end')
+        elif name in ('XUiPurchaseLBListItem.lua', 'XUiPurchaseCoatingLBListItem.lua'):
             pattern = r'(?m)^([ \t]*)self\.ImgSellout\.gameObject:SetActive\(true\)'
             script, count = re.subn(pattern, lambda match: match.group(0) + newline + match[1]
                 + 'if self.ImgHave then self.ImgHave.gameObject:SetActive(false) end', script)
@@ -75,12 +85,18 @@ def prepare(game, output, catalog_patch=False):
         raise RuntimeError('Output must be empty to preserve existing rollback backups')
     UnityPy.set_assetbundle_decrypt_key(KEY)
     base = game / 'PGR_Data' / 'StreamingAssets'
-    index = UnityPy.load(str(base / 'document/matrix/index'))
+    # Hot-update documents take precedence; 4.8 installs ship the index under resource/ only.
+    folders = ('document/matrix', 'resource/matrix')
+    index_path = next((path for folder in folders if (path := base / folder / 'index').is_file()), None)
+    if index_path is None:
+        raise RuntimeError(f'No matrix index under {base}')
+    index = UnityPy.load(str(index_path))
     index_asset = next(obj.read() for obj in index.objects if obj.type.name == 'TextAsset')
     catalog = msgpack.unpackb(index_asset.m_Script.encode('utf-8', 'surrogateescape'), strict_map_key=False)[0]
     filename = catalog['assets/temp/lua/matrix.ab'][0]
-    source = next(path for folder in ('document/matrix', 'resource/matrix')
-                  if (path := base / folder / filename).is_file())
+    source = next((path for folder in folders if (path := base / folder / filename).is_file()), None)
+    if source is None:
+        raise RuntimeError(f'Lua bundle {filename} not found under {base}')
     original = source.read_bytes()
     env = UnityPy.load(original)
     before = text_assets(env)
