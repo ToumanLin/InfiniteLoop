@@ -27,6 +27,7 @@ using AscNet.Table.V2.share.photomode;
 using MessagePack;
 using AscNet.Table.V2.share.passport;
 using System.Diagnostics;
+using Newtonsoft.Json.Linq;
 
 namespace AscNet.GameServer.Handlers
 {
@@ -65,7 +66,7 @@ namespace AscNet.GameServer.Handlers
     public class ClientVersionResponse
     {
         public int Code { get; set; }
-        public string Version { get; set; } = AccountModule.CurrentApplicationVersion;
+        public string Version { get; set; } = AccountModule.CurrentDocumentVersion;
         public bool KickOut { get; set; }
     }
 
@@ -153,8 +154,17 @@ namespace AscNet.GameServer.Handlers
 
     internal partial class AccountModule
     {
-        internal const string CurrentApplicationVersion = "4.6.0";
-        internal const string CurrentDocumentVersion = "4.6.7";
+        private static readonly Lazy<string> CurrentDocumentVersionValue = new(() =>
+        {
+            JObject versions = JsonSnapshot.LoadObject("Configs/version_config.json");
+            string latestVersion = versions.Properties()
+                .Where(property => Version.TryParse(property.Name, out _))
+                .MaxBy(property => Version.Parse(property.Name))?.Name
+                ?? throw new InvalidDataException("Configs/version_config.json: no application versions.");
+            return versions[latestVersion]?.Value<string>("DocumentVersion")
+                ?? throw new InvalidDataException($"Configs/version_config.json: {latestVersion} has no DocumentVersion.");
+        });
+        internal static string CurrentDocumentVersion => CurrentDocumentVersionValue.Value;
         private const long DefaultChatBoardId = 25000001;
         private const int ChangeAssistCharIdRejectedCode = 20002006;
 
@@ -736,8 +746,13 @@ namespace AscNet.GameServer.Handlers
         private static NotifyLogin BuildNotifyLogin(Session session)
         {
             ItemModule.ResumePendingItemUse(session);
+            ItemModule.ResumePendingBuyAsset(session);
             ItemModule.ReconcileDailyAssetPurchaseCounts(session.inventory);
             PayModule.ResumePendingPurchase(session, out _);
+            DrawModule.ResumePendingDraw(session);
+            GachaManager.RecoverPending(session);
+            MineSweepingModule.RecoverPending(session);
+            StudyProgressModule.ResumePartialTreasureClaims(session);
             BiancaTheatreModule.PrepareLogin(session);
             GuildModule.PrepareLogin(session);
             GuildBossModule.PrepareLogin(session);
@@ -1090,16 +1105,6 @@ namespace AscNet.GameServer.Handlers
             }),
             ["NotifyNewActivityCalendarData"] = SerializeStartupPayload(BuildNewActivityCalendarPayload()),
             ["NotifyAccumulateExpendData"] = SerializeStartupPayload(BuildAccumulateExpendPayload()),
-            ["NotifyExperimentData"] = SerializeStartupPayload(new Dictionary<string, object?>
-            {
-                ["FinishIds"] = Array.Empty<object>(),
-                ["ExperimentInfos"] = Array.Empty<object>()
-            }),
-            ["NotifySameColorGameData"] = SerializeStartupPayload(new Dictionary<string, object?>
-            {
-                ["ActivityId"] = 0,
-                ["BossRecords"] = Array.Empty<object>()
-            }),
             ["NotifyReviewConfig"] = SerializeStartupPayload(new Dictionary<string, object?>
             {
                 ["ReviewActivityConfigList"] = Array.Empty<object>()
@@ -1126,7 +1131,6 @@ namespace AscNet.GameServer.Handlers
             {
                 ["ChatMessages"] = Array.Empty<object>()
             }),
-            ["NotifyFestivalData"] = SerializeStartupPayload(BuildFestivalPayload()),
             ["NotifyGame2048DataDb"] = SerializeStartupPayload(BuildGame2048Payload()),
             ["NotifyGameCollectionData"] = SerializeStartupPayload(BuildGameCollectionPayload()),
             ["NotifyGoldenMinerGameInfo"] = SerializeStartupPayload(BuildGoldenMinerPayload()),
@@ -1175,6 +1179,16 @@ namespace AscNet.GameServer.Handlers
             if (name == nameof(NotifyGuildWarActivityData))
             {
                 session.SendPush(GuildWarModule.BuildLoginData(session));
+                return;
+            }
+            if (name == "NotifyExperimentData")
+            {
+                session.SendPush(name, SerializeStartupPayload(BuildExperimentPayload(session.stage)));
+                return;
+            }
+            if (name == nameof(NotifyFestivalData))
+            {
+                session.SendPush(name, SerializeStartupPayload(BuildFestivalPayload(session.stage)));
                 return;
             }
             if (name == "NotifySelfChoiceLottoData")
@@ -1393,7 +1407,12 @@ namespace AscNet.GameServer.Handlers
             BiancaTheatreModule.SendRecoveredSettlement(session);
             session.SendPush(Theatre3Module.BuildLoginData(session));
             Theatre3Module.SendRecoveredSettlement(session);
-            SendEmptyStartupPush(session, "NotifyFangKuaiData");
+            FangKuaiModule.SendLoginData(session);
+            PunishaarModule.SendLoginData(session);
+            TransfiniteTowerModule.SendLoginData(session);
+            TransfiniteTowerModule.ResumeRankReward(session);
+            MineSweepingModule.Resume(session);
+            TeamRecommendModule.SendLoginState(session);
             session.SendPush(new NotifyWorkNextRefreshTime()
             {
                 NextRefreshTime = NextDailyRefreshTime()
@@ -1425,7 +1444,7 @@ namespace AscNet.GameServer.Handlers
             session.SendPush(new NotifyFiveTwentyRecord());
             session.SendPush(purchaseDailyNotify);
             session.SendPush(purchaseRecommendConfig);
-            session.SendPush(new NotifyDrawTicketData());
+            session.SendPush(DrawTicketManager.BuildNotify(session.player));
             SendEmptyStartupPush(session, "NotifyLoginItemCollectionData");
             session.SendPush(new NotifyBigWorldMainRedPoint());
             session.SendPush(BuildExternalRequiredBigWorldPlayerData());
@@ -1447,7 +1466,7 @@ namespace AscNet.GameServer.Handlers
             SendEmptyStartupPush(session, "NotifyClientVersion");
             SendEmptyStartupPush(session, "NotifyColorTableActivityData");
             SendEmptyStartupPush(session, "NotifyCommunityData");
-            Version47EventModule.SendLoginPushes(session, DateTimeOffset.UtcNow);
+            Version47EventModule.SendLoginPushes(session, Version47EventModule.Clock());
             SendEmptyStartupPush(session, "NotifyCoupletData");
             session.SendPush(CourseModule.BuildLoginData(session.player));
             SendEmptyStartupPush(session, "NotifyDoomsdayDbChange");
@@ -1476,6 +1495,7 @@ namespace AscNet.GameServer.Handlers
             session.SendPush(TrialModule.BuildLoginData(session.player));
             session.SendPush(notifyFunctionalEntranceData);
             session.SendPush(DrawModule.BuildNotifyDrawCanLiverData(session.player));
+            session.SendPush(DrawModule.BuildNotifyDateALiveDraw());
             SendEmptyStartupPush(session, "NotifyGame2048DataDb");
             SendEmptyStartupPush(session, "NotifyGameCollectionData");
             SendCurrentEventTaskBatch(session, RetroArcadeTaskBatchEntry);
@@ -1483,6 +1503,7 @@ namespace AscNet.GameServer.Handlers
             SendEmptyStartupPush(session, "NotifyGuildSignPlayerData");
             SendEmptyStartupPush(session, "NotifyItemRestrictLoginData");
             session.SendPush(LifeTreeModule.BuildNotifyLifeTreeData(session.player));
+            session.SendPush(GachaManager.BuildSelfChoicePayload(session.player));
             SendEmptyStartupPush(session, "NotifySelfChoiceLottoData");
             session.SendPush(new NotifyLoginMailCollectionBoxData());
             SendEmptyStartupPush(session, "NotifyNonogramData");
@@ -1490,7 +1511,7 @@ namespace AscNet.GameServer.Handlers
             session.SendPush(LoadingModule.BuildLoginData(session.player));
             session.SendPush(RepeatChallengeModule.BuildLoginData(session.player));
             SendEmptyStartupPush(session, "NotifyPlayerReportData");
-            SendEmptyStartupPush(session, "NotifySameColorGameData");
+            session.SendPush(SameColorGameModule.BuildLoginData(session.player));
             session.SendPush(StrongholdModule.BuildLoginData(session.player));
             SendEmptyStartupPush(session, "NotifySucceedBossData");
             SendEmptyStartupPush(session, "NotifyTaikoMasterData");
