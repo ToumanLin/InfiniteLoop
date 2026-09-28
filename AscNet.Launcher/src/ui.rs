@@ -183,7 +183,7 @@ enum WorkResult {
         build: Option<LocalBuild>,
         package: Option<PatchPackage>,
         patch: Option<PatchState>,
-        fps: Option<i32>,
+        fps: Result<Option<i32>>,
         update: Result<Option<bool>>,
         automatic: bool,
     },
@@ -1779,8 +1779,9 @@ fn start_refresh(hwnd: HWND, check_remote: bool, automatic: bool) {
                 _ => None,
             };
             let fps = match &game {
-                Some(game) if crate::steam::valid_game_directory(game) => fps::inspect(game)?,
-                _ => None,
+                // A repacked matrix bundle must not block the rest of the refresh.
+                Some(game) if crate::steam::valid_game_directory(game) => fps::inspect(game),
+                _ => Ok(None),
             };
             let update = if check_remote {
                 local::check_update(&config.repository_url, &config.branch, build.as_ref())
@@ -2036,6 +2037,7 @@ unsafe fn finish_work(hwnd: HWND, state: &mut Window, work: Work) {
     let mut automatic_prepare = false;
     let mut source_status = None;
     let mut patch_status = None;
+    let mut fps_status = None;
     let log = match &work.result {
         Ok(WorkResult::LauncherChecked(_)) => "Launcher check complete",
         Ok(WorkResult::Refresh { .. }) => "Check complete",
@@ -2095,7 +2097,13 @@ unsafe fn finish_work(hwnd: HWND, state: &mut Window, work: Work) {
                 patch_status = Some(format!("Game patch unavailable: {reason}"));
             }
             m.patch = patch;
-            m.fps = Some(fps);
+            match fps {
+                Ok(value) => m.fps = Some(value),
+                Err(e) => {
+                    m.fps = None;
+                    fps_status = Some(local::summarized_error("inspect the FPS tweak", &e))
+                }
+            }
             match update {
                 Ok(value) => {
                     m.update_available = value;
@@ -2156,7 +2164,7 @@ unsafe fn finish_work(hwnd: HWND, state: &mut Window, work: Work) {
     }
     drop(m);
     append_log(hwnd, state, log);
-    for message in [source_status, patch_status].into_iter().flatten() {
+    for message in [source_status, patch_status, fps_status].into_iter().flatten() {
         append_log(hwnd, state, &message);
     }
     update_view(hwnd, &state.model);
