@@ -3,6 +3,7 @@ use ascnet_launcher::{
     fps,
     install::{self, PatchState},
     local::{self, LocalBuild, LocalRuntime},
+    overlay,
     package::{self, PatchPackage},
     updater,
 };
@@ -67,6 +68,7 @@ const ID_FPS_LABEL: i32 = 133;
 const ID_MUSIC_LABEL: i32 = 134;
 const ID_FPS_UNIT: i32 = 135;
 const ID_STATUS_LINE: i32 = 136;
+const ID_OFFICIAL: i32 = 137;
 const CENTERED_EDIT_HEIGHT: i32 = 22;
 const LAUNCHER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -85,6 +87,9 @@ struct Settings {
     fps_value: i32,
     #[serde(default)]
     music_muted: bool,
+    /// Prepared `patch_local_store.py` output: patched for private play, original for official.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    store_overlay: Option<PathBuf>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -92,6 +97,7 @@ impl Default for Settings {
             selected_game: None,
             fps_value: default_fps(),
             music_muted: false,
+            store_overlay: None,
         }
     }
 }
@@ -193,6 +199,10 @@ enum WorkResult {
         patch: PatchState,
     },
     Restored,
+    OfficialReady {
+        patch: PatchState,
+        app_id: String,
+    },
     FpsChanged(Option<i32>),
     Launched {
         build: LocalBuild,
@@ -1094,6 +1104,7 @@ unsafe fn create_controls(hwnd: HWND, state: &Window) {
         (ID_MINIMIZE, w!("Minimize")),
         (ID_CLOSE, w!("Close")),
         (ID_HOME_ACTION, w!("SELECT GAME")),
+        (ID_OFFICIAL, w!("Play &Official (Steam)")),
     ] {
         control(
             hwnd,
@@ -1142,6 +1153,7 @@ unsafe fn create_controls(hwnd: HWND, state: &Window) {
         (ID_MINIMIZE, state.heading_font),
         (ID_CLOSE, state.heading_font),
         (ID_HOME_ACTION, state.heading_font),
+        (ID_OFFICIAL, state.body_font),
         (ID_FPS_ENABLED, state.body_font),
         (ID_FPS_VALUE, state.body_font),
         (ID_FPS_ACTION, state.body_font),
@@ -1179,6 +1191,7 @@ unsafe fn create_controls(hwnd: HWND, state: &Window) {
         ID_MINIMIZE,
         ID_CLOSE,
         ID_HOME_ACTION,
+        ID_OFFICIAL,
         ID_FPS_ACTION,
     ] {
         let _ = SetWindowSubclass(GetDlgItem(hwnd, id), Some(button_subclass), 1, 0);
@@ -1287,7 +1300,7 @@ unsafe fn layout(hwnd: HWND, width: i32, height: i32, settings: bool) {
     let _ = MoveWindow(GetDlgItem(hwnd, ID_SETTINGS), width - 158, 9, 46, 34, true);
     let _ = MoveWindow(GetDlgItem(hwnd, ID_MINIMIZE), width - 106, 9, 46, 34, true);
     let _ = MoveWindow(GetDlgItem(hwnd, ID_CLOSE), width - 54, 9, 46, 34, true);
-    for id in [ID_STATUS, ID_DETAIL, ID_STATUS_LINE] {
+    for id in [ID_STATUS, ID_DETAIL, ID_STATUS_LINE, ID_OFFICIAL] {
         let _ = ShowWindow(
             GetDlgItem(hwnd, id),
             if settings { SW_HIDE } else { SW_SHOW },
@@ -1512,6 +1525,14 @@ unsafe fn layout(hwnd: HWND, width: i32, height: i32, settings: bool) {
             action.bottom - action.top,
             true,
         );
+        let _ = MoveWindow(
+            GetDlgItem(hwnd, ID_OFFICIAL),
+            action.left,
+            action.top - 58,
+            action.right - action.left,
+            40,
+            true,
+        );
     }
     for id in [ID_ACTION, ID_PLAY] {
         let _ = ShowWindow(GetDlgItem(hwnd, id), SW_HIDE);
@@ -1558,7 +1579,7 @@ unsafe fn command(hwnd: HWND, state: &mut Window, id: i32, notification: u16) {
                 } else if m.update_available == Some(true)
                     || m.build.is_none()
                     || m.package.is_none()
-                    || !matches!(m.patch, Some(PatchState::Current))
+                    || !matches!(m.patch, Some(PatchState::Current | PatchState::Unpatched))
                 {
                     ID_ACTION
                 } else {
@@ -1670,6 +1691,26 @@ unsafe fn command(hwnd: HWND, state: &mut Window, id: i32, notification: u16) {
             }
         }
         ID_RESTORE => start_restore(hwnd, state),
+        ID_OFFICIAL => {
+            if commit_inputs(hwnd, state)
+                && MessageBoxW(
+                    hwnd,
+                    w!("This restores the retail game files (and the original client bundle when a store overlay is configured), then starts the game through Steam on the official server.
+
+
+
+Playing AscNet again reinstalls the local patch.
+
+
+
+Continue?"),
+                    w!("Play on the official server"),
+                    MB_OKCANCEL | MB_ICONINFORMATION,
+                ) == IDOK
+            {
+                start_official(hwnd, state)
+            }
+        }
         ID_FPS_ACTION => start_fps_change(hwnd, state),
         ID_PLAY => {
             if commit_inputs(hwnd, state) {
@@ -1967,6 +2008,80 @@ fn start_restore(hwnd: HWND, state: &mut Window) {
     });
 }
 
+fn start_official(hwnd: HWND, state: &mut Window) {
+    match install::game_running() {
+        Ok(true) => {
+            show_fatal("Close PGR before switching to the official server.");
+            return;
+        }
+        Err(e) => {
+            show_fatal(&format!("{e:#}"));
+            return;
+        }
+        Ok(false) => {}
+    }
+    let (generation, events, game, package, store_overlay) = {
+        let mut m = state.model.lock().unwrap();
+        if m.busy {
+            return;
+        }
+        let Some(game) = m.settings.selected_game.clone() else {
+            drop(m);
+            show_fatal("Select a game folder");
+            return;
+        };
+        m.busy = true;
+        (
+            m.generation.fetch_add(1, Ordering::SeqCst) + 1,
+            m.events.clone(),
+            game,
+            m.package.clone(),
+            m.settings.store_overlay.clone(),
+        )
+    };
+    unsafe { set_busy(hwnd, true, "Restoring retail files for official play…") };
+    thread::spawn(move || {
+        let result = (|| {
+            // Check everything that can refuse before changing any file.
+            let app_id = crate::steam::app_id(&game)?.context(
+                "No Steam app manifest owns this game folder; official play needs the Steam install",
+            )?;
+            if let Some(dir) = &store_overlay {
+                overlay::inspect(dir, &game)?;
+            }
+            if install::has_managed_state(&game)? {
+                install::restore_with_consent(&game, &mut |s| post_progress(hwnd, &events, &s))?;
+            }
+            install::ensure_no_patch_files(&game)?;
+            let patch = match &package {
+                Some(package) => install::inspect(&game, package)?,
+                None => PatchState::Unpatched,
+            };
+            if patch != PatchState::Unpatched {
+                anyhow::bail!("Game files are not retail after restore ({patch:?}); official play refused");
+            }
+            if let Some(dir) = &store_overlay {
+                if overlay::switch(dir, &game, overlay::Side::Original)? {
+                    post_progress(hwnd, &events, "Restored the original client bundle");
+                }
+            }
+            match fps::inspect(&game) {
+                Ok(None) => {}
+                Ok(Some(value)) => anyhow::bail!(
+                    "The FPS tweak ({value} FPS) modifies the client; turn it off in Settings before official play"
+                ),
+                Err(e) => {
+                    return Err(e.context(
+                        "The client Lua bundle is modified or unreadable; restore it (or configure storeOverlay) before official play",
+                    ))
+                }
+            }
+            Ok(WorkResult::OfficialReady { patch, app_id })
+        })();
+        post_event(hwnd, &events, Event::Work(Work { generation, result }));
+    });
+}
+
 fn start_play(hwnd: HWND, state: &mut Window) {
     let model = state.model.clone();
     let prepared = {
@@ -1984,11 +2099,12 @@ fn start_play(hwnd: HWND, state: &mut Window) {
                     m.settings.selected_game.clone().unwrap(),
                     m.build.clone().unwrap(),
                     m.package.clone().unwrap(),
+                    m.settings.store_overlay.clone(),
                 ))
             }
         }
     };
-    let (generation, events, game, build, package) = match prepared {
+    let (generation, events, game, build, package, store_overlay) = match prepared {
         Ok(values) => values,
         Err(e) => {
             show_fatal(&e.to_string());
@@ -1998,11 +2114,19 @@ fn start_play(hwnd: HWND, state: &mut Window) {
     unsafe { set_busy(hwnd, true, "Checking game and resource access…") };
     thread::spawn(move || {
         let result = (|| {
-            let patch = install::inspect(&game, &package)?;
-            if !matches!(patch, PatchState::Current) {
+            if !matches!(
+                install::inspect(&game, &package)?,
+                PatchState::Current | PatchState::Unpatched
+            ) {
                 anyhow::bail!("Run Setup / Update to install the current local patch")
             }
             install::install_with_consent(&game, &package, &mut |s| post_progress(hwnd, &events, &s))?;
+            let patch = install::inspect(&game, &package)?;
+            if let Some(dir) = &store_overlay {
+                if overlay::switch(dir, &game, overlay::Side::Patched)? {
+                    post_progress(hwnd, &events, "Applied the local store client bundle");
+                }
+            }
             let mut runtime =
                 LocalRuntime::start(&build, &mut |s| post_progress(hwnd, &events, s))?;
             let origin = local_origin(&build)?;
@@ -2043,6 +2167,7 @@ unsafe fn finish_work(hwnd: HWND, state: &mut Window, work: Work) {
         Ok(WorkResult::Refresh { .. }) => "Check complete",
         Ok(WorkResult::Prepared { .. }) => "Setup complete",
         Ok(WorkResult::Restored) => "Retail files restored",
+        Ok(WorkResult::OfficialReady { .. }) => "Retail client ready for official play",
         Ok(WorkResult::FpsChanged(Some(value))) => {
             if *value > 0 {
                 "FPS tweak applied"
@@ -2135,6 +2260,28 @@ unsafe fn finish_work(hwnd: HWND, state: &mut Window, work: Work) {
             m.update_error = None;
         }
         Ok(WorkResult::Restored) => m.patch = Some(PatchState::Unpatched),
+        Ok(WorkResult::OfficialReady { patch, app_id }) => {
+            m.patch = Some(patch);
+            m.fps = Some(None);
+            drop(m);
+            append_log(hwnd, state, log);
+            update_view(hwnd, &state.model);
+            let url = wide(&format!("steam://rungameid/{app_id}"));
+            let result = ShellExecuteW(
+                hwnd,
+                w!("open"),
+                PCWSTR(url.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            );
+            if result.0 as isize <= 32 {
+                show_fatal("Steam could not be started. Start the game from Steam; the retail files are already restored.");
+            } else {
+                append_log(hwnd, state, "Starting PGR through Steam (official server)");
+            }
+            return;
+        }
         Ok(WorkResult::FpsChanged(fps)) => m.fps = Some(fps),
         Ok(WorkResult::Launched {
             build,
@@ -2205,6 +2352,7 @@ unsafe fn update_view(hwnd: HWND, model: &Arc<Mutex<Model>>) {
     );
     set_enabled(hwnd, ID_ACTION, !busy && !runtime);
     set_enabled(hwnd, ID_RESTORE, !busy && can_restore);
+    set_enabled(hwnd, ID_OFFICIAL, !busy && can_restore);
     set_enabled(hwnd, ID_PLAY, !busy && can_launch);
     let fps_value = fps_status.flatten();
     let _ = SendMessageW(
@@ -2288,7 +2436,8 @@ fn can_play(m: &Model) -> Result<()> {
     m.package
         .as_ref()
         .context("Run Setup / Update to build the local patch")?;
-    if !matches!(m.patch, Some(PatchState::Current)) {
+    // Play reinstalls a prepared patch that was restored for official play.
+    if !matches!(m.patch, Some(PatchState::Current | PatchState::Unpatched)) {
         anyhow::bail!("Run Setup / Update to install the current local patch")
     }
     if m.runtime.is_some() {

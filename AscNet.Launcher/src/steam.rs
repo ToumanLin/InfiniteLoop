@@ -37,6 +37,52 @@ pub fn discover_game() -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
+/// Resolves the Steam app id from the manifest of the library that owns `game`.
+pub fn app_id(game: &Path) -> Result<Option<String>> {
+    // The selected folder may be a link into the Steam library.
+    let game = fs::canonicalize(game)
+        .with_context(|| format!("invalid game directory: {}", game.display()))?;
+    let (Some(common), Some(name)) = (game.parent(), game.file_name()) else {
+        return Ok(None);
+    };
+    if !common
+        .file_name()
+        .is_some_and(|n| n.eq_ignore_ascii_case("common"))
+    {
+        return Ok(None);
+    }
+    let Some(apps) = common.parent() else {
+        return Ok(None);
+    };
+    let Ok(entries) = fs::read_dir(apps) else {
+        return Ok(None);
+    };
+    let name = name.to_string_lossy();
+    for entry in entries.flatten() {
+        let file = entry.file_name();
+        let file = file.to_string_lossy();
+        if !file.starts_with("appmanifest_") || !file.ends_with(".acf") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if let Some(id) = manifest_app_id(&text, &name) {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
+fn manifest_app_id(text: &str, install_dir: &str) -> Option<String> {
+    let fields = object_fields(text, "AppState").ok()?;
+    if !fields.get("installdir")?.eq_ignore_ascii_case(install_dir) {
+        return None;
+    }
+    let id = fields.get("appid")?;
+    (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then(|| id.clone())
+}
+
 pub fn valid_game_directory(path: &Path) -> bool {
     path.is_dir() && path.join("PGR.exe").is_file()
 }
@@ -176,5 +222,37 @@ mod tests {
         assert!(t
             .windows(2)
             .any(|p| p == ["path", "C:\\Program Files\\Steam"]));
+    }
+
+    #[test]
+    fn app_id_requires_matching_install_dir() {
+        let text = r#""AppState" { "appid" "4125930" "name" "Punishing: Gray Raven" "installdir" "Punishing Gray Raven" "UserConfig" { "language" "english" } }"#;
+        assert_eq!(
+            manifest_app_id(text, "punishing gray raven").as_deref(),
+            Some("4125930")
+        );
+        assert_eq!(manifest_app_id(text, "Other Game"), None);
+        let bad = r#""AppState" { "appid" "41;x" "installdir" "Punishing Gray Raven" }"#;
+        assert_eq!(manifest_app_id(bad, "Punishing Gray Raven"), None);
+    }
+
+    #[test]
+    fn app_id_reads_owning_library() {
+        let root = std::env::temp_dir().join(format!("ascnet-steam-{}", std::process::id()));
+        let game = root.join("steamapps/common/Punishing Gray Raven");
+        fs::create_dir_all(&game).unwrap();
+        fs::write(
+            root.join("steamapps/appmanifest_4125930.acf"),
+            r#""AppState" { "appid" "4125930" "installdir" "Punishing Gray Raven" }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("steamapps/appmanifest_1.acf"),
+            r#""AppState" { "appid" "1" "installdir" "Else" }"#,
+        )
+        .unwrap();
+        assert_eq!(app_id(&game).unwrap().as_deref(), Some("4125930"));
+        assert_eq!(app_id(&root).unwrap(), None);
+        fs::remove_dir_all(&root).unwrap();
     }
 }

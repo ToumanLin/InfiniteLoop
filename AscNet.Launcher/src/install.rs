@@ -272,6 +272,23 @@ pub fn install_with_consent(
     install(client, package, progress)
 }
 
+/// Whether a launcher-managed patch (or an interrupted transaction) is present.
+pub fn has_managed_state(client: &Path) -> Result<bool> {
+    let client = checked_client(client)?;
+    Ok(read_state(&client)?.is_some() || client.join(STATE_DIR).join(JOURNAL_FILE).exists())
+}
+
+/// Fails if patch-only files that retail never ships are still in the client.
+pub fn ensure_no_patch_files(client: &Path) -> Result<()> {
+    let client = checked_client(client)?;
+    for name in ["version.dll", "lucia.dll", "libraries.txt"] {
+        if client.join(name).exists() {
+            bail!("{name} is still in the game folder; it is not a retail file");
+        }
+    }
+    Ok(())
+}
+
 pub fn restore_with_consent(client: &Path, progress: &mut dyn FnMut(String)) -> Result<()> {
     #[cfg(windows)]
     if needs_elevation(client)? {
