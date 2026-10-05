@@ -66,7 +66,7 @@ namespace AscNet.GameServer.Handlers
     public class ClientVersionResponse
     {
         public int Code { get; set; }
-        public string Version { get; set; } = AccountModule.CurrentDocumentVersion;
+        public string Version { get; set; } = string.Empty;
         public bool KickOut { get; set; }
     }
 
@@ -83,14 +83,6 @@ namespace AscNet.GameServer.Handlers
             public long GetTime { get; set; }
             public long EndTime { get; set; }
         }
-    }
-
-    [MessagePackObject(true)]
-    public class NotifyExternalRequiredBigWorldPlayerData
-    {
-        public List<int> EnteredBigWorldIds = new();
-        public int Gender;
-        public List<int> CommanderFashionBags = new();
     }
 
     [MessagePackObject(true)]
@@ -165,6 +157,10 @@ namespace AscNet.GameServer.Handlers
                 ?? throw new InvalidDataException($"Configs/version_config.json: {latestVersion} has no DocumentVersion.");
         });
         internal static string CurrentDocumentVersion => CurrentDocumentVersionValue.Value;
+        // The handshake document version is the client's own regional build (4.8.12 for every 4.8.0 region today);
+        // sessions that never handshook (or sent an empty one) get the shared EN default.
+        internal static string DocumentVersionFor(Session session) =>
+            string.IsNullOrEmpty(session.ClientDocumentVersion) ? CurrentDocumentVersion : session.ClientDocumentVersion;
         private const long DefaultChatBoardId = 25000001;
         private const int ChangeAssistCharIdRejectedCode = 20002006;
 
@@ -187,16 +183,12 @@ namespace AscNet.GameServer.Handlers
         ];
 
 
-        private static NotifyExternalRequiredBigWorldPlayerData BuildExternalRequiredBigWorldPlayerData()
-        {
-            return DlcModule.BuildExternalRequiredBigWorldPlayerData();
-        }
-
-
         [RequestPacketHandler("HandshakeRequest")]
         public static void HandshakeRequestHandler(Session session, Packet.Request packet)
         {
-            _ = packet.Deserialize<HandshakeRequest>();
+            HandshakeRequest request = packet.Deserialize<HandshakeRequest>();
+            session.ClientDocumentVersion = request.DocumentVersion;
+            session.ClientApplicationVersion = request.ApplicationVersion;
             // TODO: make this somehow universal, look into better architecture to handle packets
             // and automatically log their deserialized form
 
@@ -355,6 +347,7 @@ namespace AscNet.GameServer.Handlers
                     RequestNo = request.LastMsgSeqNo
                 }, packet.Id);
                 session.GuildIdentityReady = true;
+                BossModule.ReconcileReconnect(session);
                 PartnerModule.SyncArchive(session);
                 TaskModule.SendTaskSync(session);
             }
@@ -372,7 +365,7 @@ namespace AscNet.GameServer.Handlers
         public static void ClientVersionRequestHandler(Session session, Packet.Request packet)
         {
             _ = packet.Deserialize<ClientVersionRequest>();
-            session.SendResponse(new ClientVersionResponse(), packet.Id);
+            session.SendResponse(new ClientVersionResponse { Version = DocumentVersionFor(session) }, packet.Id);
         }
 
         [RequestPacketHandler("SetServerBeanRequest")]
@@ -743,7 +736,10 @@ namespace AscNet.GameServer.Handlers
                 .ToList();
         }
 
-        private static NotifyLogin BuildNotifyLogin(Session session)
+        private static NotifyLogin BuildNotifyLogin(Session session) =>
+            BuildNotifyLogin(session, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+
+        private static NotifyLogin BuildNotifyLogin(Session session, long now)
         {
             ItemModule.ResumePendingItemUse(session);
             ItemModule.ResumePendingBuyAsset(session);
@@ -753,13 +749,14 @@ namespace AscNet.GameServer.Handlers
             GachaManager.RecoverPending(session);
             MineSweepingModule.RecoverPending(session);
             StudyProgressModule.ResumePartialTreasureClaims(session);
+            PartnerModule.ResumePendingPartnerDecompose(session);
             BiancaTheatreModule.PrepareLogin(session);
             GuildModule.PrepareLogin(session);
             GuildBossModule.PrepareLogin(session);
             GuildWarModule.PrepareLogin(session);
             GuildDormModule.PrepareLogin(session);
             WheelchairManualModule.RefreshProgress(session);
-            BossModule.PrepareLogin(session);
+            BossModule.PrepareLoginAt(session, now);
             BossInshotModule.PrepareLogin(session.player, DateTimeOffset.UtcNow);
             FashionStoryModule.PrepareLogin(session.player, DateTimeOffset.UtcNow);
             TransfiniteModule.PrepareLogin(session, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
@@ -1098,11 +1095,6 @@ namespace AscNet.GameServer.Handlers
             {
                 ["IgnoreChannelIds"] = Array.Empty<object>()
             }),
-            ["NotifyClientVersion"] = SerializeStartupPayload(new Dictionary<string, object?>
-            {
-                ["Version"] = CurrentDocumentVersion,
-                ["KickOut"] = false
-            }),
             ["NotifyNewActivityCalendarData"] = SerializeStartupPayload(BuildNewActivityCalendarPayload()),
             ["NotifyAccumulateExpendData"] = SerializeStartupPayload(BuildAccumulateExpendPayload()),
             ["NotifyReviewConfig"] = SerializeStartupPayload(new Dictionary<string, object?>
@@ -1194,6 +1186,15 @@ namespace AscNet.GameServer.Handlers
             if (name == "NotifySelfChoiceLottoData")
             {
                 session.SendPush(name, SerializeStartupPayload(BuildSelfChoiceLottoPayload(session.player)));
+                return;
+            }
+            if (name == "NotifyClientVersion")
+            {
+                session.SendPush(name, SerializeStartupPayload(new Dictionary<string, object?>
+                {
+                    ["Version"] = DocumentVersionFor(session),
+                    ["KickOut"] = false
+                }));
                 return;
             }
             if (SupportedStartupPushPayloads.TryGetValue(name, out byte[]? supportedPayload))
@@ -1311,7 +1312,7 @@ namespace AscNet.GameServer.Handlers
             Theatre5Module.PrepareLogin(session);
             Theatre6Module.PrepareLogin(session);
             Theatre6PvpModule.RecoverPendingDefense(session);
-            NotifyLogin notifyLogin = BuildNotifyLogin(session);
+            NotifyLogin notifyLogin = BuildNotifyLogin(session, currentTime);
 
 
             NotifyAssistData notifyAssistData = new()
@@ -1446,8 +1447,8 @@ namespace AscNet.GameServer.Handlers
             session.SendPush(purchaseRecommendConfig);
             session.SendPush(DrawTicketManager.BuildNotify(session.player));
             SendEmptyStartupPush(session, "NotifyLoginItemCollectionData");
-            session.SendPush(new NotifyBigWorldMainRedPoint());
-            session.SendPush(BuildExternalRequiredBigWorldPlayerData());
+            session.SendPush(BigWorld.BigWorldModule.BuildMainRedPoint(session.player));
+            session.SendPush(BigWorld.BigWorldModule.BuildExternalRequiredPlayerData(session.player));
             session.SendPush(BuildCurrentAccumulatedPayData());
             SendEmptyStartupPush(session, "NotifyAccumulateExpendData");
             if (arenaResult is not null)
@@ -1483,7 +1484,7 @@ namespace AscNet.GameServer.Handlers
                 session.SendPush(dyeMergeData);
             session.SendPush(BossInshotModule.BuildNotifyBossInshotData(session.player));
             session.SendPush(BossInshotModule.BuildNotifyBossInshotPlayback(session.player));
-            session.SendPush(BossModule.BuildLoginData(session.player));
+            session.SendPush(BossModule.BuildLoginData(session.player, currentTime));
             NotifyBossActivityData? bossActivityData = BossModule.BuildActivityLoginData(session);
             if (bossActivityData is not null)
                 session.SendPush(bossActivityData);

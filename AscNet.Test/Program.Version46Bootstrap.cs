@@ -232,7 +232,7 @@ internal partial class Program
     {
         Type controller = Type.GetType("AscNet.SDKServer.Controllers.ConfigController, AscNet.SDKServer", throwOnError: true)!;
         MethodInfo handle = RequiredMethod(controller, "HandleConfigRequest", BindingFlags.Static | BindingFlags.NonPublic, [typeof(HttpContext)]);
-        Dictionary<string, string> Serve(string package, string? cdnKey)
+        string ServeRaw(string package, string? cdnKey)
         {
             DefaultHttpContext context = new();
             context.Request.Scheme = "http";
@@ -241,7 +241,11 @@ internal partial class Program
             context.Request.RouteValues["version"] = "4.8.0";
             if (cdnKey is not null)
                 context.Request.RouteValues["cdnKey"] = cdnKey;
-            return ((string)handle.Invoke(null, [context])!)
+            return (string)handle.Invoke(null, [context])!;
+        }
+        Dictionary<string, string> Serve(string package, string? cdnKey)
+        {
+            return ServeRaw(package, cdnKey)
                 .Split('\n', StringSplitOptions.RemoveEmptyEntries)
                 .Select(line => line.TrimEnd('\r').Split('\t'))
                 .Where(cells => cells.Length >= 3)
@@ -251,24 +255,65 @@ internal partial class Program
         foreach (string? cdnKey in new[] { null, "B7OBn4RZic1fijNJ" })
         {
             Dictionary<string, string> tw = Serve("com.kurogame.punishing.grayraven.tw", cdnKey);
-            AssertEqual("4.8.10", tw["DocumentVersion"], "TW 4.8 DocumentVersion");
-            AssertEqual("4.8.10", tw["LaunchModuleVersion"], "TW 4.8 LaunchModuleVersion");
-            AssertEqual("b683b400819a9095ec5ae0945cd95064809aa82f", tw["IndexSha1"], "TW 4.8 IndexSha1");
-            AssertEqual("3d7e0c4479062d60fc6c8311ef8022ac1976eed6", tw["LaunchIndexSha1"], "TW 4.8 LaunchIndexSha1");
+            AssertEqual("4.8.12", tw["DocumentVersion"], "TW 4.8 DocumentVersion");
+            AssertEqual("4.8.12", tw["LaunchModuleVersion"], "TW 4.8 LaunchModuleVersion");
+            AssertEqual("887f009ff8660e8175ca836cd77682be1fc6a14b", tw["IndexSha1"], "TW 4.8 IndexSha1");
+            AssertEqual("e82247e760ba66611975d7126ccef2a734f28742", tw["LaunchIndexSha1"], "TW 4.8 LaunchIndexSha1");
             AssertEqual("http://prod-twcdn-ak.pgr-game.com/prod", tw["PrimaryCdns"], "TW PrimaryCdns");
             AssertEqual("http://prod-twcdn-aliyun.kurogame.net/prod", tw["SecondaryCdns"], "TW SecondaryCdns");
             AssertEqual("5", tw["Channel"], "TW Channel");
             AssertEqual(false, tw.ContainsKey("IndexMd5"), "TW omits IndexMd5 like its live config");
 
             Dictionary<string, string> en = Serve("com.kurogame.punishing.grayraven.en", cdnKey);
-            AssertEqual("4.8.10", en["DocumentVersion"], "EN 4.8 DocumentVersion");
-            AssertEqual("b22b87996db98720100e39586167440a005ea531", en["IndexSha1"], "EN 4.8 IndexSha1");
-            AssertEqual("9b4ecc9495e317975240f009bdb0876423750a5c", en["LaunchIndexSha1"], "EN 4.8 LaunchIndexSha1");
+            AssertEqual("4.8.12", en["DocumentVersion"], "EN 4.8 DocumentVersion");
+            AssertEqual("a2b5b6c93a32f8a88c22eb3827617ffd2a3438e1", en["IndexSha1"], "EN 4.8 IndexSha1");
+            AssertEqual("1591a0ac3f4ed08dbd98430b9b1b2d968da1ef15", en["LaunchIndexSha1"], "EN 4.8 LaunchIndexSha1");
             AssertEqual("http://prod-encdn-ak.pgr-game.com/prod", en["PrimaryCdns"], "EN PrimaryCdns");
             AssertEqual("http://prod-encdn-aliyun.kurogame.net/prod", en["SecondaryCdns"], "EN SecondaryCdns");
             AssertEqual("5", en["Channel"], "EN Channel");
             AssertEqual("c5d4baac85a6e37b8109ea43dc045d31", en["IndexMd5"], "EN keeps its live IndexMd5");
+
+            // KR and JP are served from the same process, interleaved with EN/TW. Each must reproduce its real
+            // config.tab row-for-row; only the AscNet-owned rows (server list, pay callbacks) may differ, and only by origin.
+            AssertRegionTabMatchesRetail(ServeRaw("com.kurogame.punishing.grayraven.kr", cdnKey), "kr", "KR",
+                ["PayCallbackUrl", "ServerListStr", "AndroidPayCallbackUrl", "IosPayCallbackUrl", "OneStorePayCallbackUrl", "PcPayCallbackUrl", "ChannelServerListStr"]);
+            AssertRegionTabMatchesRetail(ServeRaw("com.kurogame.punishing.grayraven.jp", cdnKey), "jp", "JP",
+                ["PayCallbackUrl", "ServerListStr", "AndroidPayCallbackUrl", "IosPayCallbackUrl", "GooglePointOrderUrl", "PcPayCallbackUrl", "ChannelServerListStr"]);
+
+            AssertRegionTabMatchesRetail(ServeRaw("com.kurogame.haru.kuro", cdnKey), "cn", "CN",
+                ["PayCallbackUrl", "ServerListStr", "ChannelServerListStr"]);
+            Dictionary<string, string> cn = Serve("com.kurogame.haru.kuro", cdnKey);
+            AssertEqual(false, cn.ContainsKey("IndexMd5"), "CN omits unpublished IndexMd5");
+            if (!cn["ServerListStr"].EndsWith("/api/Login/Login-cn", StringComparison.Ordinal))
+                throw new InvalidDataException("CN gate lost its region discriminator.");
+
+            // KR/JP rows must not leak back into the EN defaults served afterwards.
+            Dictionary<string, string> enAgain = Serve("com.kurogame.punishing.grayraven.en", cdnKey);
+            AssertEqual("1", enAgain["DownloadMethod"], "EN DownloadMethod after JP/KR requests");
+            AssertEqual("empty", enAgain["PicComposition"], "EN PicComposition after JP/KR requests");
+            AssertEqual("2048", enAgain["MemoryLimit"], "EN MemoryLimit after JP/KR requests");
+            AssertEqual(false, enAgain.ContainsKey("DisableGuide"), "EN does not inherit KR-only rows");
         }
+    }
+
+    private static void AssertRegionTabMatchesRetail(string served, string region, string label, string[] ownedKeys)
+    {
+        string[] retail = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Region", $"{region}.tab")).Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        string[] actual = served.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        AssertEqual(retail.Length, actual.Length, $"{label} config.tab row count");
+        List<string> owned = new();
+        for (int i = 0; i < retail.Length; i++)
+        {
+            // The capture's own login/pay hosts are the only values AscNet replaces.
+            string expected = System.Text.RegularExpressions.Regex.Replace(retail[i], @"http://(prod-pay-(kr|jp)\.pgr-game\.com|101\.33\.70\.36:55556|8\.209\.200\.222:2333)", "http://127.0.0.1:8080");
+            // CN lists the official gate plus raw-IP mirrors per login channel; AscNet serves one isolated Login-cn gate for each.
+            expected = System.Text.RegularExpressions.Regex.Replace(expected, @"https://haru-gf-login\.kurogame\.com/api/Login/Login(;http://\d+\.\d+\.\d+\.\d+/api/Login/Login)*", "http://127.0.0.1:8080/api/Login/Login-cn");
+            expected = expected.Replace("http://haru-gf-pay.kurogame.com", "http://127.0.0.1:8080");
+            AssertEqual(expected, actual[i], $"{label} config.tab line {i}");
+            if (expected != retail[i])
+                owned.Add(retail[i].Split('\t')[0]);
+        }
+        AssertEqual(string.Join(",", ownedKeys), string.Join(",", owned), $"{label} AscNet-owned rows");
     }
 
     private static void ValidateVersion46ConfigurationMetadata()
@@ -363,6 +408,7 @@ internal partial class Program
 
     private static void ValidateVersion46LoginShape()
     {
+        using MongoCollectionOverride noOpStages = MongoCollectionOverride.InstallNoOpStageCollection(); // login persists Stage rollover
         const long uid = 46_001;
         AscNet.Common.Database.Player player = CreateDrawCompatibilityPlayer(uid);
         player.PlayerData.Level = 80;

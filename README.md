@@ -12,13 +12,15 @@ The current server data/config target is **4.8**, not a claim of complete 4.8 ga
 | --- | --- |
 | Client package | `com.kurogame.pc.punishing.grayraven.en` |
 | Application version | `4.8.0` |
-| Document version | `4.8.10` |
-| Launch module version | `4.8.10` |
+| Document version | `4.8.12` |
+| Launch module version | `4.8.12` |
 | Steam/PC channel | `205` |
 | Game server TCP port | `2335` by default |
 | SDK/HTTP URL used by the runner | `http://127.0.0.1:8080` by default |
 
-`Resources/Configs/version_config.json` includes the authoritative `4.8.0 -> 4.8.10` version/hash tuple and retains older tuples. The native launcher's binary allowlist targets client 4.8.0, EN and TW (launcher 1.0.7, patch 0.3.0).
+`Resources/Configs/version_config.json` includes the authoritative `4.8.0 -> 4.8.12` version/hash tuple and retains older tuples. The native launcher's binary allowlist targets client 4.8.0, EN, TW, KR, JP and CN (launcher 1.0.8, patch 0.4.0; CN: see `Docs/cn-sdk-support.md`).
+
+One instance serves every region: the package in the config request picks the `Packages` entry (document/launch version, hashes and its `Region` block of CDNs, channel, server-list label and config rows) in `version_config.json`, and each TCP session reports its own document version from the handshake. Tables, notices and gameplay stay the shared EN-derived set for all regions. KR and JP config tuples come from their live config.tab; KR/JP native hooks are statically checked only (see `AscNet.Launcher/docs/client-download.md`) until a KR/JP client run.
 
 ## What changed in this branch
 
@@ -107,6 +109,7 @@ This branch adds or fixes current-client server behavior for:
 - Story course rewards.
 - Lucia: Lotus's hidden interlude uses table-derived replay flags and persisted objective events, with an immediate hidden-stage notification and relog recovery. Old clear records do not prove objective completion; replay episode 6 after updating. Clearing the episode without its hidden objective does not unlock episode 7.
 - Boss single login payload shape.
+- Pain Cage consumes one Attempt per normal stage's first weekly clear, manual or Auto Clear; replays consume none. Current-week clears do not unlock Auto Clear until weekly rollover archives their records; prior archived eligibility remains unchanged until then. Weekly rollover resets completion flags, and ambiguous legacy clears are also reset. Codex clears update scores and first-clear task progress without marking weekly stages complete.
 - Guide table compatibility for current guide TSVs.
 - Player cost-time upload.
 - Player point upload.
@@ -290,6 +293,20 @@ Run the focused server compatibility harness:
 dotnet run --project AscNet.Test/AscNet.Test.csproj -- --same-color-game-compat-only
 ```
 
+### Babylonia (BigWorld) world core
+
+`AscNet.GameServer/Handlers/BigWorld/BigWorldModule*.cs` owns world enter/leave, instance levels, the engine save channel (`DlcWorldSaveData`, `DlcWorldSceneObjectData`, `DlcSceneObjectStateSet`, `DlcWorldEnterSucceed`, `BigWorldCurNpcPosUpdate`), scene-object collection, box counts, teleporters, guide/fov/custom-param/red-point/map-pin state and the StatusSync XRpc channel. Nothing is replayed from captures; the retail oracles live in `AscNet.Test/Fixtures/BigWorld` for tests only.
+
+- **Scene objects:** `Resources/table/share/statussyncfight/level/sceneconfig/LevelSceneObject.tsv` is extracted from the installed client's level scene config (`Scripts/import_bigworld_scene_objects_4_7.py`): place ids (from 1; the lounge's interaction anchors 1-8 are below 1000), `CollectableComponent` (reward id, POI/course group) and `TeleporterComponent`. Collecting a collectable grants its `BigWorldReward` once, updates the level box count and the course explore POI. The same importer writes `LevelSpot.tsv` (`XTableLevelSpotNew` position/rotation per group).
+- **Dormitory (Commandant's Lounge, 4003):** `BigWorldDormitory.cs` is the server half of `XGameplayDormitory`. Enter snapshot and `SgDormSaveAndApplyLayoutRequest` (applied or re-saved preset) replicate the photo wall, photos, album photos, adorns, frame wall and frame goods of the player's applied layouts as `XSceneObject`s (children of the gameplay actor) at the `DormitoryConfig` spots; `Dormitory*.tsv` map `SgDormFurniture.SceneObjId` to scene object bases. Quest 2002's "View Photo Wall" target (scene object 1) is the `ConfigGroup_5001` anchor whose interaction completes 2002054 through `OnInteract`. Wall-plane placement, place id 0 and the parent uuid are AscNet policy (no retail lounge capture).
+- **Interactions:** `RpcPlayerInteractRequest` resolves the target (scene object or level NPC) and its `LevelInteractOption.tsv` row (same importer; `Config` holds the option's `CompleteActionList`). Order: collect push, `RpcNpcInteractStartNotify`, [`XRpcTeleportResetOnGroundRequest` when the list teleports, then the list via `BigWorldLevelActions.Run`], `RpcNpcInteractFinishNotify` after the client finishes the list, then `BigWorldQuestRuntime.OnInteract`. Unknown actor/option/level or a launcher that is not the player's NPC returns code 4.
+- **Policies:** a world's levels are the `Level` rows sharing its default level's `SectorName` prefix; the entrance red point stays on until the world is entered; an offline engine reports a collected object as `Active = false`.
+- **Engine mode (temporary experiment switch):** `ASCNET_BIGWORLD_ENGINE=online-min` (default) sends `WorldData.Online = true` with a generated `RepFight` (installed-client 11-key layout, `InitialQuests` from persisted quests) and a minimal `RepLevel` (player controller, team-NPC replicates, server controller) and answers `LoadCompleteRequest` with a generated XRpc bootstrap. `ASCNET_BIGWORLD_ENGINE=offline` sends `Online = false` with no `FightData`/`LevelData` (client-hosted engine). Any other value fails the enter. Set `ASCNET_DUMP_BIGWORLD=1` to dump BigWorld requests/responses/pushes to `.runtime/bigworld-packet-dumps`.
+
+```bash
+dotnet run --project AscNet.Test/AscNet.Test.csproj -- --big-world-core-only
+```
+
 ### Gender setup fix
 
 The current client needs gender selection to update both persisted player state and the live in-session player cache.
@@ -399,13 +416,15 @@ Common options:
 | `--gate-fallback-username <name>` | Map unknown Steam/KRSDK gate logins to an existing local account. |
 | `--no-ensure-account` | Skip local account creation/checking and disable implicit unknown-user fallback. |
 | `--seed-krsdk-cache` | Opt in to writing local AscNet account data into KRSDK cache files. |
-| `--krsdk-cache-dir <path>` | Override the KRSDK login-cache directory used for repair/seeding. |
+| `--krsdk-cache-dir <path>` | Override the KRSDK login-cache directory (default: `KR_<ProjectId>/<ProductId>` read from the installed client's `KRSDK.bin`). |
+| `--client-dir <path>` | Installed game directory used to auto-detect the region (default `$ASCNET_CLIENT_DIR`/`$PGR_ASCNET_DIR`, else the Steam path in `launch-pgr-ascnet.sh`). |
+| `--client-region en\|tw\|kr\|jp` | Override region detection; unreadable clients fall back to EN. |
 | `--no-proxy` | Run only AscNet; skip mitmproxy. |
 | `--no-smoke` | Skip config smoke checks before launching. |
 | `--proxy-log <path>` | Write redacted request/response diagnostics. |
 | `--launch-cmd ...` | Command to start after AscNet/proxy are ready. |
 
-On native Windows, pass the client's actual `%APPDATA%\KR_G143\A1855` directory with `--krsdk-cache-dir` when using KRSDK cache repair or `--seed-krsdk-cache`; the default path targets the macOS/CrossOver launch example.
+On native Windows, pass the client's actual `%APPDATA%\KR_<ProjectId>\<ProductId>` directory with `--krsdk-cache-dir` when using KRSDK cache repair or `--seed-krsdk-cache`; the default path targets the macOS/CrossOver launch example.
 
 The runner sets:
 

@@ -23,12 +23,20 @@ namespace AscNet.GameServer
         public Stage stage = default!;
         public Fight? fight;
         public int? OpenedGuideGroupId;
+        // Regional build identity from HandshakeRequest; null until the client handshakes.
+        public string? ClientDocumentVersion;
+        public string? ClientApplicationVersion;
         public BossSinglePendingScore? PendingBossSingleScore;
+        public HashSet<int> PendingBossSingleRolloverStageIds { get; } = [];
         public Inventory inventory = default!;
         public int? PendingEnterWorldChatRequestId;
         public int? PendingGetWorldChannelInfoRequestId;
+        // BigWorld: set by DlcWorldSaveData in online engine mode, drained by LoadCompleteRequest.
         public bool PendingBigWorldLoadCompleteXRpc;
         public bool PendingBigWorldStartFightNotify;
+        // BigWorld world the session is inside (0 = not in BigWorld) and when its fight snapshot was built.
+        public int BigWorldWorldId;
+        public DateTime BigWorldFightStartedAt;
         public readonly Dictionary<(uint EquipId, int Slot), ResonanceInfo> PendingEquipResonances = new();
         public int? AppliedTeamPrefabId;
         public readonly Dictionary<uint, (uint FashionId, int WeaponFashionId)> RandomFashionRolls = new();
@@ -121,7 +129,9 @@ namespace AscNet.GameServer
                         && tundraPending.ResponseName is not (nameof(Handlers.FinishTaskResponse) or nameof(Handlers.FinishMultiTaskResponse))
                         && !Handlers.Theatre4Module.CanDispatchPendingRequest(this, request))
                     || (currentPlayer.Theatre6.PendingMutation is not null
-                        && !Handlers.Theatre6Module.CanDispatchPendingRequest(this, request))))
+                        && !Handlers.Theatre6Module.CanDispatchPendingRequest(this, request))
+                    || (currentPlayer.PendingPartnerDecompose is not null
+                        && request.Name is not ("PartnerDecomposeRequest" or "ReconnectRequest"))))
             {
                 string responseName = request.Name.EndsWith("Request", StringComparison.Ordinal)
                     ? request.Name[..^7] + "Response" : request.Name + "Response";
@@ -289,7 +299,9 @@ namespace AscNet.GameServer
                                 {
                                     case Packet.ContentType.Request:
                                         Packet.Request request = MessagePackSerializer.Deserialize<Packet.Request>(packet.Content, Packet.InboundOptions);
-                                        RequestPacketHandlerDelegate? requestPacketHandler = PacketFactory.GetRequestPacketHandler(request.Name);
+                                        string requestName = request.Name ?? string.Empty;
+                                        ProbeBigWorldPacket("in", requestName, request.Content ?? [], request.Id, 0);
+                                        RequestPacketHandlerDelegate? requestPacketHandler = PacketFactory.GetRequestPacketHandler(requestName);
                                         if (requestPacketHandler is not null)
                                         {
                                             // TODO: with new logger this will be unnecessary
@@ -533,9 +545,12 @@ namespace AscNet.GameServer
         private static bool ShouldDumpBigWorldPacket(string name)
         {
             return name.Contains("BigWorld", StringComparison.Ordinal)
-                || name.StartsWith("DlcWorld", StringComparison.Ordinal)
+                || name.StartsWith("Dlc", StringComparison.Ordinal)
+                || name.StartsWith("NotifyDlc", StringComparison.Ordinal)
+                || name.StartsWith("NotifySg", StringComparison.Ordinal)
+                || name.StartsWith("LeaveInstLevel", StringComparison.Ordinal)
                 || name.StartsWith("XRpc", StringComparison.Ordinal)
-                || name is "NotifySgDormData"
+                || name is "NotifyTask"
                     or "StartFightNotify"
                     or "LoadCompleteRequest"
                     or "LoadCompleteResponse"
