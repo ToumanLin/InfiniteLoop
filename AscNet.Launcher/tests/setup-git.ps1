@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($SetupScript, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors -join "`n") }
-$names = @('Fail', 'Invoke-Checked', 'Git-Output', 'Update-Checkout', 'Assert-FreePort')
+$names = @('Fail', 'Invoke-Checked', 'Git-Output', 'Update-Checkout', 'Assert-FreePort', 'Get-ExcludedTcpPortRanges', 'Test-ExcludedTcpPort')
 foreach ($fn in $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
     if ($names -contains $fn.Name) { . ([scriptblock]::Create($fn.Extent.Text)) }
 }
@@ -70,7 +70,9 @@ try {
         try { Assert-FreePort $listener.LocalEndpoint.Port 'fixture' } catch { $refused = $true }
         if (-not $refused) { throw 'occupied port accepted' }
     } finally { $listener.Stop() }
-    Write-Output 'PASS: clone, fast-forward, bundled orchestration, dirty preservation, divergence refusal, occupied-port refusal'
+    $ranges = @([pscustomobject]@{ Start = 9509; End = 9608 })
+    if (-not (Test-ExcludedTcpPort 9581 $ranges) -or (Test-ExcludedTcpPort 9609 $ranges)) { throw 'excluded-port detection failed' }
+    Write-Output 'PASS: clone, fast-forward, bundled orchestration, dirty preservation, divergence refusal, occupied-port refusal, excluded-port detection'
 } finally {
     Remove-Item -LiteralPath $temp -Recurse -Force
 }

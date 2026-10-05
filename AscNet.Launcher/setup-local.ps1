@@ -176,6 +176,23 @@ function New-FreePort([int[]]$Excluded) {
         if ($Excluded -notcontains $port) { return $port }
     }
 }
+function Get-ExcludedTcpPortRanges {
+    $output = & netsh interface ipv4 show excludedportrange protocol=tcp 2>$null
+    if ($LASTEXITCODE -ne 0) { return @() }
+    $ranges = @()
+    foreach ($line in $output) {
+        if ("$line" -match '^\s*(\d+)\s+(\d+)(?:\s+\*)?\s*$') {
+            $ranges += [pscustomobject]@{ Start = [int]$Matches[1]; End = [int]$Matches[2] }
+        }
+    }
+    return $ranges
+}
+function Test-ExcludedTcpPort([int]$Port, [object[]]$Ranges) {
+    foreach ($range in $Ranges) {
+        if ($Port -ge $range.Start -and $Port -le $range.End) { return $true }
+    }
+    return $false
+}
 function Assert-FreePort([int]$Port, [string]$Label) {
     $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, $Port)
     try { $listener.Start() }
@@ -231,8 +248,29 @@ try {
     [IO.Directory]::CreateDirectory((Join-Path $Root 'data\mongo')) | Out-Null
     [IO.Directory]::CreateDirectory((Join-Path $Root 'logs')) | Out-Null
 
+    $portsChanged = $false
+    $excludedRanges = @(Get-ExcludedTcpPortRanges)
     if ($oldState) {
         $sdkPort = [int]$oldState.sdkPort; $gamePort = [int]$oldState.gamePort; $mongoPort = [int]$oldState.mongoPort
+        # A previous migration attempt may have written config.json before its build failed.
+        # Reuse those ports on retry instead of generating another pair.
+        if ((Test-ExcludedTcpPort $gamePort $excludedRanges) -or (Test-ExcludedTcpPort $mongoPort $excludedRanges)) {
+            if (Test-Path -LiteralPath $persistentConfig) {
+                try { $savedConfig = [IO.File]::ReadAllText($persistentConfig, [Text.Encoding]::UTF8) | ConvertFrom-Json }
+                catch { Fail "Persistent config.json is invalid: $($_.Exception.Message)" }
+                if ([string]$savedConfig.GameServer.Host -cne '127.0.0.1' -or [string]$savedConfig.Database.Host -cne '127.0.0.1' -or [string]$savedConfig.Database.Name -cne 'asc_net') {
+                    Fail 'Persistent config.json network fields differ from the previous build; setup will not overwrite user configuration.'
+                }
+                if (Test-ExcludedTcpPort $gamePort $excludedRanges) {
+                    $savedGamePort = [int]$savedConfig.GameServer.Port
+                    if ($savedGamePort -ne $gamePort) { $gamePort = $savedGamePort; $portsChanged = $true }
+                }
+                if (Test-ExcludedTcpPort $mongoPort $excludedRanges) {
+                    $savedMongoPort = [int]$savedConfig.Database.Port
+                    if ($savedMongoPort -ne $mongoPort) { $mongoPort = $savedMongoPort; $portsChanged = $true }
+                }
+            }
+        }
     } elseif (Test-Path -LiteralPath $persistentConfig) {
         try { $config = [IO.File]::ReadAllText($persistentConfig, [Text.Encoding]::UTF8) | ConvertFrom-Json; $gamePort = [int]$config.GameServer.Port; $mongoPort = [int]$config.Database.Port }
         catch { Fail "Persistent config.json has invalid GameServer/Database ports: $($_.Exception.Message)" }
@@ -240,11 +278,34 @@ try {
     } else {
         $sdkPort = New-FreePort @(); $gamePort = New-FreePort @($sdkPort); $mongoPort = New-FreePort @($sdkPort, $gamePort)
     }
+    # Windows can reserve a previously selected port after an OS/Hyper-V update. Move only
+    # excluded ports; an ordinary listener still fails the explicit free-port checks below.
+    foreach ($entry in @(@('SDK', 'sdkPort'), @('Game', 'gamePort'), @('MongoDB', 'mongoPort'))) {
+        $label, $name = $entry
+        $previous = Get-Variable -Name $name -ValueOnly
+        if (Test-ExcludedTcpPort $previous $excludedRanges) {
+            $replacement = New-FreePort @($sdkPort, $gamePort, $mongoPort)
+            Set-Variable -Name $name -Value $replacement
+            $portsChanged = $true
+            Write-Host "$label port $previous is reserved by Windows; using $replacement instead."
+        }
+    }
     if (@($sdkPort, $gamePort, $mongoPort) | Where-Object { $_ -lt 1 -or $_ -gt 65535 }) { Fail 'Persisted ports must each be between 1 and 65535.' }
     if (@($sdkPort, $gamePort, $mongoPort) | Group-Object | Where-Object { $_.Count -ne 1 }) { Fail 'Persisted SDK, game, and MongoDB ports must be distinct.' }
     Assert-FreePort $sdkPort 'SDK'
     Assert-FreePort $gamePort 'Game'
     Assert-FreePort $mongoPort 'MongoDB'
+    if ($oldState -and $portsChanged -and (Test-Path -LiteralPath $persistentConfig)) {
+        try { $config = [IO.File]::ReadAllText($persistentConfig, [Text.Encoding]::UTF8) | ConvertFrom-Json }
+        catch { Fail "Persistent config.json is invalid: $($_.Exception.Message)" }
+        if ([string]$config.GameServer.Host -cne '127.0.0.1' -or @([int]$oldState.gamePort, $gamePort) -notcontains [int]$config.GameServer.Port -or
+            [string]$config.Database.Host -cne '127.0.0.1' -or @([int]$oldState.mongoPort, $mongoPort) -notcontains [int]$config.Database.Port -or
+            [string]$config.Database.Name -cne 'asc_net') {
+            Fail 'Persistent config.json network fields differ from the previous build; setup will not overwrite user configuration.'
+        }
+        Set-NetworkConfig $config $gamePort $mongoPort
+        Write-JsonAtomic $persistentConfig $config
+    }
     if (-not (Test-Path -LiteralPath $persistentConfig)) {
         $config = [IO.File]::ReadAllText((Join-Path $checkout 'Resources\Configs\config.json'), [Text.Encoding]::UTF8) | ConvertFrom-Json
         Set-NetworkConfig $config $gamePort $mongoPort
@@ -265,7 +326,7 @@ try {
     $buildRoot = Join-Path $Root 'build'; [IO.Directory]::CreateDirectory($buildRoot) | Out-Null
     $final = Join-Path $buildRoot $revision
     $stage = Join-Path $buildRoot "$revision.tmp-$PID"
-    if (-not (Test-Path -LiteralPath (Join-Path $final 'server\AscNet.dll')) -or -not (Test-Path -LiteralPath (Join-Path $final 'patch\supported-client.json'))) {
+    if ($portsChanged -or -not (Test-Path -LiteralPath (Join-Path $final 'server\AscNet.dll')) -or -not (Test-Path -LiteralPath (Join-Path $final 'patch\supported-client.json'))) {
         if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
         [IO.Directory]::CreateDirectory($stage) | Out-Null
         try {
